@@ -1,22 +1,85 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/txomon/glinet-pikvm-cli/internal/config"
+	"github.com/txomon/glinet-pikvm-cli/internal/kvmd"
 )
 
+// waitPollInterval is how often waitFor rechecks its condition.
+const waitPollInterval = 250 * time.Millisecond
+
 // globals holds the persistent flag values shared by every subcommand.
-// Later commands read from it (and, once the API client lands, will get a
-// (g *globals) client(...) helper) so keep it the single source of truth.
 type globals struct {
 	device     string
 	output     string
 	configPath string
 	timeout    time.Duration
+}
+
+// client loads the config file, resolves the device named by --device (or
+// default_device when empty), and builds a kvmd client for it. A wide config
+// file permission prints config.PermWarning to stderr but is not an error.
+func (g *globals) client(stderr io.Writer) (*kvmd.Client, config.Device, error) {
+	f, err := config.Load(g.configPath)
+	if err != nil {
+		return nil, config.Device{}, err
+	}
+	if w := config.PermWarning(g.configPath); w != "" {
+		fmt.Fprintln(stderr, w)
+	}
+	d, err := f.Device(g.device)
+	if err != nil {
+		return nil, config.Device{}, err
+	}
+	return kvmd.New(d, g.timeout), d, nil
+}
+
+// waitFor polls cond every interval until it reports true, returns an error,
+// or ctx is done. cond is checked immediately before the first wait.
+func waitFor(ctx context.Context, interval time.Duration, cond func() (bool, error)) error {
+	for {
+		ok, err := cond()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// portLink is the per-port HDMI/USB link summary shared by status and port.
+type portLink struct {
+	Port int    `json:"port"`
+	ID   string `json:"id"`
+	HDMI bool   `json:"hdmi"`
+	USB  bool   `json:"usb"`
+}
+
+// portLinks builds the per-port link summary from a switch state, in port
+// order (index 0 is port 1).
+func portLinks(sw kvmd.SwitchState) []portLink {
+	links := make([]portLink, len(sw.Ports))
+	for i, p := range sw.Ports {
+		links[i] = portLink{
+			Port: i + 1,
+			ID:   p.ID,
+			HDMI: i < len(sw.VideoLinks) && sw.VideoLinks[i],
+			USB:  i < len(sw.USBLinks) && sw.USBLinks[i],
+		}
+	}
+	return links
 }
 
 // noArgs rejects any positional argument, as a UsageError.
@@ -67,6 +130,9 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 	}
 
 	root.AddCommand(newVersionCmd(g))
+	root.AddCommand(newStatusCmd(g))
+	root.AddCommand(newPortCmd(g))
+	root.AddCommand(newScreenshotCmd(g))
 
 	return root
 }
