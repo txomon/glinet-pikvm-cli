@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run a command in the pinned Go container. Never build Go on the host.
+set -eu
+cd "$(dirname "$0")"
+mkdir -p .cache
+exec docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD":/src -w /src \
+  -e HOME=/tmp -e GOCACHE=/src/.cache/go-build -e GOMODCACHE=/src/.cache/mod \
+  -e CGO_ENABLED=0 -e GOFLAGS=-buildvcs=false \
+  --network host \
+  golang:1.27.0 "$@"
