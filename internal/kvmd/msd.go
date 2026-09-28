@@ -125,9 +125,10 @@ func (c *Client) MSDUpload(ctx context.Context, name string, r io.Reader, size i
 	return decodeEnvelope("/msd/write", resp, nil)
 }
 
-// MSDSetParams selects image as the drive's image (or "" to eject it while
-// disconnected) and sets its cdrom and rw flags. The drive must not be
-// connected.
+// MSDSetParams selects image as the drive's image and sets its cdrom and rw
+// flags. image must name an image already in the device's storage; all
+// three query params are always sent, matching what the fake and the real
+// device expect. The drive must not be connected.
 func (c *Client) MSDSetParams(ctx context.Context, image string, cdrom, rw bool) error {
 	q := url.Values{
 		"image": {image},

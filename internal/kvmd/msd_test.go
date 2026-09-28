@@ -3,6 +3,7 @@ package kvmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -48,5 +49,23 @@ func TestMSDNullImage(t *testing.T) {
 	st, err := New(kvmdfake.New(t).Device(), time.Second).MSD(context.Background())
 	if err != nil || st.Drive.Image != "" || st.Drive.Connected {
 		t.Fatalf("%+v %v", st, err)
+	}
+}
+
+func TestMSDSetParamsUnknownImage(t *testing.T) {
+	c := New(kvmdfake.New(t).Device(), time.Second)
+	err := c.MSDSetParams(context.Background(), "nope.img", false, false)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != "MsdUnknownImageError" {
+		t.Fatalf("want MsdUnknownImageError, got %v", err)
+	}
+}
+
+func TestMSDRemoveUnknownImage(t *testing.T) {
+	c := New(kvmdfake.New(t).Device(), time.Second)
+	err := c.MSDRemove(context.Background(), "nope.img")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != "MsdUnknownImageError" {
+		t.Fatalf("want MsdUnknownImageError, got %v", err)
 	}
 }

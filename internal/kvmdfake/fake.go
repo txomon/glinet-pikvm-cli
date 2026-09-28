@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/txomon/glinet-pikvm-cli/internal/config"
 	"github.com/txomon/glinet-pikvm-cli/internal/keys"
@@ -44,6 +45,7 @@ type Failure struct {
 type MSDImage struct {
 	Data     []byte
 	Complete bool
+	ModTS    float64
 }
 
 // MSDDrive mirrors the mass-storage drive stanza in msd.json. Image is the
@@ -479,14 +481,16 @@ func (f *Server) routeMouseRelative(w http.ResponseWriter, r *http.Request) {
 
 // msdImageState renders one MSDImage as the fields upstream reports for a
 // storage.images entry (and, with name and in_storage added, for a selected
-// drive.image object).
+// drive.image object). This matches the real device's observed shape:
+// {"complete":true,"mod_ts":1790638314.49,"removable":true,"size":65536} for
+// a storage entry, with "name" and "in_storage" added when it is also the
+// selected drive image. There is no "writable" field.
 func msdImageState(img *MSDImage) map[string]any {
 	return map[string]any{
 		"size":      int64(len(img.Data)),
 		"complete":  img.Complete,
 		"removable": true,
-		"writable":  true,
-		"mod_ts":    0,
+		"mod_ts":    img.ModTS,
 	}
 }
 
@@ -538,7 +542,7 @@ func (f *Server) routeMSDWrite(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "Error", err.Error())
 		return
 	}
-	f.MSD.Images[name] = &MSDImage{Data: body, Complete: true}
+	f.MSD.Images[name] = &MSDImage{Data: body, Complete: true, ModTS: float64(time.Now().UnixNano()) / 1e9}
 	ok(w, map[string]any{"image": map[string]any{"name": name, "size": len(body), "written": len(body)}})
 }
 
