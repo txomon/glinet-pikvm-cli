@@ -18,10 +18,14 @@ import (
 
 // Client talks to one kvmd device over HTTP.
 type Client struct {
-	http     *http.Client
-	baseURL  string
-	user     string
-	password string
+	http *http.Client
+	// uploadHTTP has no Timeout, for MSD uploads that can run well past the
+	// normal request timeout. It shares http's Transport. The context passed
+	// to each request still bounds it.
+	uploadHTTP *http.Client
+	baseURL    string
+	user       string
+	password   string
 }
 
 // New builds a Client for d. Requests time out after timeout.
@@ -31,10 +35,11 @@ func New(d config.Device, timeout time.Duration) *Client {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	return &Client{
-		http:     &http.Client{Timeout: timeout, Transport: tr},
-		baseURL:  strings.TrimRight(d.URL, "/") + "/api",
-		user:     d.User,
-		password: d.Password,
+		http:       &http.Client{Timeout: timeout, Transport: tr},
+		uploadHTTP: &http.Client{Transport: tr},
+		baseURL:    strings.TrimRight(d.URL, "/") + "/api",
+		user:       d.User,
+		password:   d.Password,
 	}
 }
 
@@ -53,6 +58,14 @@ func (e *APIError) Error() string {
 // do sends one request with the device's auth headers and returns the raw
 // response. The caller must close the response body.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body io.Reader, contentType string) (*http.Response, error) {
+	return c.doWithClient(ctx, c.http, method, path, q, body, contentType, -1)
+}
+
+// doWithClient is do but through hc instead of the client's default timeout
+// client, and with an explicit contentLength when >= 0 (a streamed body may
+// not be able to report its own length via body.Len()). The caller must
+// close the response body.
+func (c *Client) doWithClient(ctx context.Context, hc *http.Client, method, path string, q url.Values, body io.Reader, contentType string, contentLength int64) (*http.Response, error) {
 	u := c.baseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -64,10 +77,13 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
 	req.Header.Set("X-KVMD-User", c.user)
 	req.Header.Set("X-KVMD-Passwd", c.password)
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("kvmd: request %s: %w", path, err)
 	}
@@ -102,7 +118,13 @@ func (c *Client) doEnvelope(ctx context.Context, method, path string, q url.Valu
 		return err
 	}
 	defer resp.Body.Close()
+	return decodeEnvelope(path, resp, out)
+}
 
+// decodeEnvelope reads resp's body, unwraps the {"ok","result"} envelope,
+// and decodes result into out. A non-2xx status or ok=false becomes an
+// *APIError. The caller owns closing resp.Body.
+func decodeEnvelope(path string, resp *http.Response, out any) error {
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("kvmd: read response from %s: %w", path, err)

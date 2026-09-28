@@ -40,7 +40,14 @@ type Failure struct {
 	Msg    string
 }
 
-// MSDDrive mirrors the mass-storage drive stanza in msd.json.
+// MSDImage is one image held in the fake's in-memory MSD image store.
+type MSDImage struct {
+	Data     []byte
+	Complete bool
+}
+
+// MSDDrive mirrors the mass-storage drive stanza in msd.json. Image is the
+// selected image's name, or "" for the null-image case.
 type MSDDrive struct {
 	CDROM     bool
 	Connected bool
@@ -48,13 +55,15 @@ type MSDDrive struct {
 	RW        bool
 }
 
-// MSDState mirrors the mass-storage state in msd.json. Later tasks wire up
-// the /msd endpoints that read and mutate it.
+// MSDState mirrors the mass-storage state in msd.json, backed by an
+// in-memory image store keyed by name.
 type MSDState struct {
 	Enabled bool
 	Online  bool
 	Busy    bool
 	Drive   MSDDrive
+	Images  map[string]*MSDImage
+	Free    int64
 }
 
 // Server is an in-process fake kvmd. Construct with New; it starts an
@@ -141,6 +150,18 @@ func New(t testing.TB) *Server {
 	capturedFPS, _ := sourceObj["captured_fps"].(float64)
 	hdmiSignal, _ := hdmiObj["signal"].(bool)
 
+	msdDoc := loadResult("msd")
+	msdEnabled, _ := msdDoc["enabled"].(bool)
+	msdOnline, _ := msdDoc["online"].(bool)
+	msdBusy, _ := msdDoc["busy"].(bool)
+	msdStorageDoc, _ := msdDoc["storage"].(map[string]any)
+	msdPartsDoc, _ := msdStorageDoc["parts"].(map[string]any)
+	msdRootPartDoc, _ := msdPartsDoc[""].(map[string]any)
+	msdFree, _ := msdRootPartDoc["free"].(float64)
+	msdDriveDoc, _ := msdDoc["drive"].(map[string]any)
+	msdCDROM, _ := msdDriveDoc["cdrom"].(bool)
+	msdRW, _ := msdDriveDoc["rw"].(bool)
+
 	f := &Server{
 		t:              t,
 		ClientUser:     "admin",
@@ -160,10 +181,12 @@ func New(t testing.TB) *Server {
 		EDID:           edid,
 		EDIDPresets:    loadArray("upgrade_edid_list"),
 		MSD: MSDState{
-			Enabled: true,
-			Online:  false,
-			Busy:    false,
-			Drive:   MSDDrive{CDROM: true, Connected: false, Image: "", RW: false},
+			Enabled: msdEnabled,
+			Online:  msdOnline,
+			Busy:    msdBusy,
+			Drive:   MSDDrive{CDROM: msdCDROM, Connected: false, Image: "", RW: msdRW},
+			Images:  map[string]*MSDImage{},
+			Free:    int64(msdFree),
 		},
 		FailNext: map[string]Failure{},
 
@@ -257,6 +280,11 @@ func (f *Server) newMux() http.Handler {
 	mux.HandleFunc("POST /api/hid/events/send_mouse_button", f.routeMouseButton)
 	mux.HandleFunc("POST /api/hid/events/send_mouse_wheel", f.routeMouseWheel)
 	mux.HandleFunc("POST /api/hid/events/send_mouse_relative", f.routeMouseRelative)
+	mux.HandleFunc("GET /api/msd", f.routeMSD)
+	mux.HandleFunc("POST /api/msd/write", f.routeMSDWrite)
+	mux.HandleFunc("POST /api/msd/set_params", f.routeMSDSetParams)
+	mux.HandleFunc("POST /api/msd/set_connected", f.routeMSDSetConnected)
+	mux.HandleFunc("POST /api/msd/remove", f.routeMSDRemove)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -446,6 +474,128 @@ func (f *Server) routeMouseWheel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *Server) routeMouseRelative(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
+}
+
+// msdImageState renders one MSDImage as the fields upstream reports for a
+// storage.images entry (and, with name and in_storage added, for a selected
+// drive.image object).
+func msdImageState(img *MSDImage) map[string]any {
+	return map[string]any{
+		"size":      int64(len(img.Data)),
+		"complete":  img.Complete,
+		"removable": true,
+		"writable":  true,
+		"mod_ts":    0,
+	}
+}
+
+func (f *Server) routeMSD(w http.ResponseWriter, r *http.Request) {
+	images := map[string]any{}
+	for name, img := range f.MSD.Images {
+		images[name] = msdImageState(img)
+	}
+
+	var driveImage any
+	if f.MSD.Drive.Image != "" {
+		img, ok := f.MSD.Images[f.MSD.Drive.Image]
+		if !ok {
+			img = &MSDImage{}
+		}
+		state := msdImageState(img)
+		state["name"] = f.MSD.Drive.Image
+		state["in_storage"] = true
+		driveImage = state
+	}
+
+	ok(w, map[string]any{
+		"enabled": f.MSD.Enabled,
+		"online":  f.MSD.Online,
+		"busy":    f.MSD.Busy,
+		"drive": map[string]any{
+			"cdrom":     f.MSD.Drive.CDROM,
+			"connected": f.MSD.Drive.Connected,
+			"rw":        f.MSD.Drive.RW,
+			"image":     driveImage,
+		},
+		"storage": map[string]any{
+			"images": images,
+			"parts": map[string]any{
+				"": map[string]any{"free": f.MSD.Free},
+			},
+		},
+	})
+}
+
+func (f *Server) routeMSDWrite(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("image")
+	if name == "" {
+		fail(w, http.StatusBadRequest, "ValidatorError", "image name required")
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "Error", err.Error())
+		return
+	}
+	f.MSD.Images[name] = &MSDImage{Data: body, Complete: true}
+	ok(w, map[string]any{"image": map[string]any{"name": name, "size": len(body), "written": len(body)}})
+}
+
+func (f *Server) routeMSDSetParams(w http.ResponseWriter, r *http.Request) {
+	if f.MSD.Drive.Connected {
+		fail(w, http.StatusBadRequest, "MsdConnectedError", "MSD is connected to Server, but shouldn't for this operation")
+		return
+	}
+	q := r.URL.Query()
+	if name := q.Get("image"); name != "" {
+		if _, ok := f.MSD.Images[name]; !ok {
+			fail(w, http.StatusBadRequest, "MsdUnknownImageError", "The image is not found in the storage")
+			return
+		}
+		f.MSD.Drive.Image = name
+	}
+	if v := q.Get("cdrom"); v != "" {
+		f.MSD.Drive.CDROM = v == "1"
+	}
+	if v := q.Get("rw"); v != "" {
+		f.MSD.Drive.RW = v == "1"
+	}
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMSDSetConnected(w http.ResponseWriter, r *http.Request) {
+	connected := r.URL.Query().Get("connected") == "1"
+	if connected {
+		if f.MSD.Drive.Image == "" {
+			fail(w, http.StatusBadRequest, "MsdImageNotSelected", "The image is not selected")
+			return
+		}
+		if _, ok := f.MSD.Images[f.MSD.Drive.Image]; !ok {
+			fail(w, http.StatusBadRequest, "MsdUnknownImageError", "The image is not found in the storage")
+			return
+		}
+		f.MSD.Drive.Connected = true
+	} else {
+		f.MSD.Drive.Connected = false
+	}
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMSDRemove(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("image")
+	if f.MSD.Drive.Connected && f.MSD.Drive.Image == name {
+		fail(w, http.StatusBadRequest, "MsdConnectedError", "MSD is connected to Server, but shouldn't for this operation")
+		return
+	}
+	if _, ok := f.MSD.Images[name]; !ok {
+		fail(w, http.StatusBadRequest, "MsdUnknownImageError", "The image is not found in the storage")
+		return
+	}
+	delete(f.MSD.Images, name)
+	if f.MSD.Drive.Image == name {
+		f.MSD.Drive.Image = ""
+	}
 	ok(w, map[string]any{})
 }
 
