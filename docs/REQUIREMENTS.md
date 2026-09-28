@@ -129,9 +129,12 @@ verb per operation, `--output=json` everywhere, `--file` for images.
   resolution that suits the Chromebook used to view it.
 * Ports may be switched freely during testing. Leave arwen on port 4 when done.
 * All four EDID profiles may be flashed. Leave `chromebook` flashed when done.
-* HID tests on pippin stay inert: unbound keys (F13 to F24) and small mouse moves, verified
-  by reading `/dev/input/by-id/usb-Glinet_Glinet_Composite_Device_CAFEBABE-*` on pippin.
-  No typing into windows, no clicks.
+* HID tests on pippin go to an empty text editor javier left focused. Confirm the editor
+  still has focus before sending anything; send plain text, Backspace, arrows and F13 to
+  F24 only, no shortcuts, no Enter outside the editor, no clicks. Verify through
+  screenshots and `/dev/input/by-id/usb-Glinet_Glinet_Composite_Device_CAFEBABE-*`.
+* Port 3 is durin at a getty login prompt. Typing there is allowed if it is erased with
+  Backspace; never press Enter.
 * MSD test: upload a tiny generated image, attach it to port 4, confirm pippin sees the
   USB disk, detach and delete it.
 * pippin's GNOME autolock was disabled for unattended work (`idle-delay` was 300,
