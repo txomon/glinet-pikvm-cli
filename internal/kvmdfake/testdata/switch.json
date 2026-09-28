@@ -1,0 +1,186 @@
+{
+    "ok": true,
+    "result": {
+        "atx": {
+            "busy": [],
+            "leds": {
+                "hdd": [],
+                "power": []
+            }
+        },
+        "beacons": {
+            "downlinks": [],
+            "ports": [],
+            "uplinks": []
+        },
+        "colors": {
+            "active": {
+                "blink_ms": 0,
+                "blue": 0,
+                "brightness": 128,
+                "green": 255,
+                "red": 0
+            },
+            "beacon": {
+                "blink_ms": 250,
+                "blue": 156,
+                "brightness": 255,
+                "green": 44,
+                "red": 228
+            },
+            "bootloader": {
+                "blink_ms": 0,
+                "blue": 0,
+                "brightness": 128,
+                "green": 170,
+                "red": 255
+            },
+            "flashing": {
+                "blink_ms": 0,
+                "blue": 255,
+                "brightness": 128,
+                "green": 170,
+                "red": 0
+            },
+            "inactive": {
+                "blink_ms": 0,
+                "blue": 0,
+                "brightness": 64,
+                "green": 0,
+                "red": 255
+            }
+        },
+        "edids": {
+            "all": {
+                "default": {
+                    "data": "00FFFFFFFFFFFF0031D8717701010101231A010380351E780E0565A756529C270F50543FED00B300A9C0950090408180814081C0714F011D007251D01E206E2855000F282100001E000000FF0043414645424142452020202020000000FD00324B0F5211000A202020202020000000FC0050694B564D2056330A202020200143020317314A841F13223E213D203C0167030C001000802D011D007251D01E206E2855000F282100001E000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000015",
+                    "name": "Default",
+                    "parsed": {
+                        "audio": false,
+                        "mfc_id": "LNX",
+                        "monitor_name": "PiKVM V3",
+                        "monitor_serial": "CAFEBABE",
+                        "product_id": 30577,
+                        "serial": 16843009
+                    }
+                }
+            },
+            "used": []
+        },
+        "model": {
+            "firmware": {
+                "version": 8
+            },
+            "limits": {
+                "atx": {
+                    "click_delays": {
+                        "power": {
+                            "default": 0.5,
+                            "max": 10,
+                            "min": 0
+                        },
+                        "power_long": {
+                            "default": 5.5,
+                            "max": 10,
+                            "min": 0
+                        },
+                        "reset": {
+                            "default": 0.5,
+                            "max": 10,
+                            "min": 0
+                        }
+                    }
+                }
+            },
+            "ports": [
+                {
+                    "atx": {
+                        "click_delays": {
+                            "power": 0.5,
+                            "power_long": 5.5,
+                            "reset": 0.5
+                        }
+                    },
+                    "channel": 0,
+                    "id": "1.1",
+                    "name": "",
+                    "unit": 0,
+                    "video": {
+                        "dummy": true
+                    }
+                },
+                {
+                    "atx": {
+                        "click_delays": {
+                            "power": 0.5,
+                            "power_long": 5.5,
+                            "reset": 0.5
+                        }
+                    },
+                    "channel": 1,
+                    "id": "1.2",
+                    "name": "",
+                    "unit": 0,
+                    "video": {
+                        "dummy": true
+                    }
+                },
+                {
+                    "atx": {
+                        "click_delays": {
+                            "power": 0.5,
+                            "power_long": 5.5,
+                            "reset": 0.5
+                        }
+                    },
+                    "channel": 2,
+                    "id": "1.3",
+                    "name": "",
+                    "unit": 0,
+                    "video": {
+                        "dummy": true
+                    }
+                },
+                {
+                    "atx": {
+                        "click_delays": {
+                            "power": 0.5,
+                            "power_long": 5.5,
+                            "reset": 0.5
+                        }
+                    },
+                    "channel": 3,
+                    "id": "1.4",
+                    "name": "",
+                    "unit": 0,
+                    "video": {
+                        "dummy": true
+                    }
+                }
+            ],
+            "units": []
+        },
+        "summary": {
+            "active_id": "1.4",
+            "active_port": 3,
+            "synced": true
+        },
+        "usb_host": false,
+        "usb_otg": {
+            "links": [
+                false,
+                true,
+                true,
+                true
+            ]
+        },
+        "video": {
+            "links": [
+                true,
+                true,
+                true,
+                true
+            ]
+        }
+    }
+}

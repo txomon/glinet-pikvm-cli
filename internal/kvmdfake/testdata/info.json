@@ -1,0 +1,143 @@
+{
+    "ok": true,
+    "result": {
+        "auth": {
+            "enabled": true
+        },
+        "extras": {
+            "ipmi": {
+                "daemon": "kvmd-ipmi",
+                "description": "Show IPMI information",
+                "enabled": false,
+                "icon": "share/svg/ipmi.svg",
+                "name": "IPMI",
+                "path": "ipmi",
+                "place": 21,
+                "port": 623,
+                "started": false
+            },
+            "janus": {
+                "daemon": "kvmd-janus",
+                "description": "Janus WebRTC Gateway",
+                "enabled": true,
+                "name": "Janus",
+                "path": "janus",
+                "place": -1,
+                "started": true
+            },
+            "janus_static": {
+                "daemon": "kvmd-janus-static",
+                "description": "Janus WebRTC Gateway (Static Config)",
+                "enabled": true,
+                "name": "Janus Static",
+                "path": "janus",
+                "place": -1,
+                "started": true
+            },
+            "media": {
+                "daemon": "kvmd-media",
+                "description": "KVMD Media Proxy",
+                "enabled": true,
+                "name": "Media",
+                "path": "media",
+                "place": -1,
+                "started": true
+            },
+            "pion": {
+                "daemon": "gl-pion",
+                "description": "Pion WebRTC Gateway",
+                "enabled": true,
+                "name": "Pion",
+                "path": "/usr/bin/gl-pion",
+                "place": -1,
+                "started": true
+            },
+            "vnc": {
+                "daemon": "kvmd-vnc",
+                "description": "Show VNC information",
+                "enabled": false,
+                "icon": "share/svg/vnc.svg",
+                "name": "VNC",
+                "path": "vnc",
+                "place": 20,
+                "port": 5900,
+                "started": false
+            },
+            "webrtc": {
+                "daemon": "kvmd-webrtc",
+                "description": "WebRTC Signaling Server",
+                "enabled": true,
+                "name": "WebRTC",
+                "path": "webrtc",
+                "place": -1,
+                "started": true
+            },
+            "webterm": {
+                "daemon": "kvmd-webterm",
+                "description": "Open terminal in a web browser",
+                "enabled": true,
+                "icon": "extras/webterm/terminal.svg",
+                "name": "Terminal",
+                "path": "extras/webterm/ttyd",
+                "place": 10,
+                "started": true
+            }
+        },
+        "health": {
+            "cpu": {
+                "percent": 29
+            },
+            "mem": {
+                "available": 715116544,
+                "percent": 30.8,
+                "total": 1034002432
+            },
+            "net": {
+                "bytes_recv": 288695318,
+                "bytes_sent": 17991239847,
+                "rx_rate": 54630,
+                "tx_rate": 177498
+            },
+            "temp": {
+                "cpu": 47.57
+            },
+            "throttling": null
+        },
+        "meta": {
+            "kvm": {},
+            "server": {
+                "host": "localhost.localdomain"
+            }
+        },
+        "system": {
+            "kernel": {
+                "machine": "aarch64",
+                "release": "6.1.141",
+                "system": "Linux",
+                "version": "#1 SMP Mon Aug 31 11:12:26 CST 2026"
+            },
+            "kvmd": {
+                "version": "4.82"
+            },
+            "platform": {
+                "base": "Rockchip RV1126B-P EVB V14 Board",
+                "board": "rpi4",
+                "model": "v3",
+                "serial": "903E4449AD83A2EF",
+                "type": "rpi",
+                "video": "hdmi"
+            },
+            "streamer": {
+                "app": "ustreamer",
+                "features": {
+                    "HAS_PDEATHSIG": true,
+                    "WITH_GPIO": false,
+                    "WITH_PTHREAD_NP": false,
+                    "WITH_SETPROCTITLE": true,
+                    "WITH_SYSTEMD": false
+                },
+                "version": "6.13"
+            }
+        }
+    }
+}

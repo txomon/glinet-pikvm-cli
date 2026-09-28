@@ -1,0 +1,41 @@
+{
+    "ok": true,
+    "result": {
+        "available_devices": {
+            "/dev/mmcblk0p10": {
+                "filesystem": "exfat",
+                "is_current": true,
+                "label": "GLKVM",
+                "size": 60078129152,
+                "uuid": "6A1B-1BCB"
+            }
+        },
+        "busy": false,
+        "drive": {
+            "cdrom": true,
+            "connected": false,
+            "image": null,
+            "rw": false
+        },
+        "drive_partition": {
+            "cdrom": false,
+            "connected": false,
+            "image": null,
+            "rw": true
+        },
+        "enabled": true,
+        "online": false,
+        "storage": {
+            "downloading": null,
+            "images": {},
+            "parts": {
+                "": {
+                    "free": 60075671552,
+                    "size": 60076064768,
+                    "writable": true
+                }
+            },
+            "uploading": null
+        }
+    }
+}
