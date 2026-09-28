@@ -82,6 +82,8 @@ type Server struct {
 	RealResolution string
 	Width          int
 	Height         int
+	CapturedFPS    int
+	HDMISignal     bool
 	EDID           string
 	EDIDPresets    []map[string]any
 	SnapshotJPEG   []byte
@@ -130,6 +132,13 @@ func New(t testing.TB) *Server {
 	edidGet := loadResult("upgrade_get_edid")
 	edid, _ := edidGet["edid"].(string)
 
+	streamerDoc := loadResult("streamer")
+	streamerObj, _ := streamerDoc["streamer"].(map[string]any)
+	sourceObj, _ := streamerObj["source"].(map[string]any)
+	hdmiObj, _ := streamerObj["hdmi"].(map[string]any)
+	capturedFPS, _ := sourceObj["captured_fps"].(float64)
+	hdmiSignal, _ := hdmiObj["signal"].(bool)
+
 	f := &Server{
 		t:              t,
 		ClientUser:     "admin",
@@ -144,6 +153,8 @@ func New(t testing.TB) *Server {
 		RealResolution: "1200x752@60",
 		Width:          1200,
 		Height:         752,
+		CapturedFPS:    int(capturedFPS),
+		HDMISignal:     hdmiSignal,
 		EDID:           edid,
 		EDIDPresets:    loadArray("upgrade_edid_list"),
 		MSD: MSDState{
@@ -196,6 +207,30 @@ func (f *Server) Calls() []Call {
 	return out
 }
 
+// CurrentEDID returns the fake's current EDID hex, including any change
+// made through a POST /upgrade/edid flash.
+func (f *Server) CurrentEDID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.EDID
+}
+
+// SetSource updates the streamer's capture state. w and h are the reported
+// source resolution; a snapshot is only regenerated at this size when both
+// are positive, since a JPEG cannot be encoded at zero size and the offline
+// case never reads it.
+func (f *Server) SetSource(online bool, real string, w, h int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.SourceOnline = online
+	f.RealResolution = real
+	f.Width = w
+	f.Height = h
+	if w > 0 && h > 0 {
+		f.SnapshotJPEG = generateSnapshot(w, h)
+	}
+}
+
 // newMux builds the routed handler, wrapped with the shared middleware that
 // logs calls, enforces auth, and consumes FailNext.
 func (f *Server) newMux() http.Handler {
@@ -206,6 +241,11 @@ func (f *Server) newMux() http.Handler {
 	mux.HandleFunc("POST /api/switch/set_active", f.routeSetActive)
 	mux.HandleFunc("POST /api/switch/set_active_next", f.routeSetActiveNext)
 	mux.HandleFunc("POST /api/switch/set_active_prev", f.routeSetActivePrev)
+	mux.HandleFunc("GET /api/streamer", f.routeStreamer)
+	mux.HandleFunc("GET /api/streamer/snapshot", f.routeSnapshot)
+	mux.HandleFunc("GET /api/upgrade/get_edid", f.routeGetEDID)
+	mux.HandleFunc("GET /api/upgrade/edid_list", f.routeEDIDList)
+	mux.HandleFunc("POST /api/upgrade/edid", f.routeFlashEDID)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -298,6 +338,69 @@ func (f *Server) routeSetActiveNext(w http.ResponseWriter, r *http.Request) {
 func (f *Server) routeSetActivePrev(w http.ResponseWriter, r *http.Request) {
 	f.ActivePort = (f.ActivePort - 1 + len(f.VideoLinks)) % len(f.VideoLinks)
 	ok(w, map[string]any{})
+}
+
+func (f *Server) routeStreamer(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{
+		"streamer": map[string]any{
+			"source": map[string]any{
+				"online":          f.SourceOnline,
+				"real_resolution": f.RealResolution,
+				"resolution": map[string]any{
+					"width":  f.Width,
+					"height": f.Height,
+				},
+				"captured_fps": f.CapturedFPS,
+			},
+			"hdmi": map[string]any{
+				"signal": f.HDMISignal,
+			},
+		},
+	})
+}
+
+func (f *Server) routeSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !f.SourceOnline {
+		fail(w, http.StatusServiceUnavailable, "UnavailableError", "Service Unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	_, _ = w.Write(f.SnapshotJPEG)
+}
+
+func (f *Server) routeGetEDID(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{"edid": f.EDID})
+}
+
+func (f *Server) routeEDIDList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(f.EDIDPresets)
+}
+
+func (f *Server) routeFlashEDID(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		fail(w, http.StatusBadRequest, "ValidatorError", err.Error())
+		return
+	}
+	stripped := stripWhitespace(r.FormValue("edid"))
+	if len(stripped) != 256 && len(stripped) != 512 {
+		fail(w, http.StatusBadRequest, "ValidatorError", fmt.Sprintf("invalid edid length %d, want 256 or 512 hex chars", len(stripped)))
+		return
+	}
+	f.EDID = strings.ToLower(stripped)
+	ok(w, map[string]any{"status": "success", "message": "EDID data has been written and applied"})
+}
+
+// stripWhitespace removes spaces, tabs, and newlines from s.
+func stripWhitespace(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // parsePort mirrors device semantics: "1.N" selects host port N (1-based,
