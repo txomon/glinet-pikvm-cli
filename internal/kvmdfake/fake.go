@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/txomon/glinet-pikvm-cli/internal/config"
+	"github.com/txomon/glinet-pikvm-cli/internal/keys"
 )
 
 //go:embed testdata/*.json
@@ -93,6 +94,7 @@ type Server struct {
 	switchDoc  map[string]any
 	infoDoc    map[string]any
 	versionDoc map[string]any
+	hidDoc     map[string]any
 }
 
 // loadResult reads testdata/<name>.json, expects the standard
@@ -168,6 +170,7 @@ func New(t testing.TB) *Server {
 		switchDoc:  loadResult("switch"),
 		infoDoc:    loadResult("info"),
 		versionDoc: loadResult("upgrade_version"),
+		hidDoc:     loadResult("hid"),
 	}
 	f.SnapshotJPEG = generateSnapshot(f.Width, f.Height)
 
@@ -246,6 +249,14 @@ func (f *Server) newMux() http.Handler {
 	mux.HandleFunc("GET /api/upgrade/get_edid", f.routeGetEDID)
 	mux.HandleFunc("GET /api/upgrade/edid_list", f.routeEDIDList)
 	mux.HandleFunc("POST /api/upgrade/edid", f.routeFlashEDID)
+	mux.HandleFunc("GET /api/hid", f.routeHID)
+	mux.HandleFunc("POST /api/hid/events/send_key", f.routeSendKey)
+	mux.HandleFunc("POST /api/hid/events/send_shortcut", f.routeSendShortcut)
+	mux.HandleFunc("POST /api/hid/print", f.routePrint)
+	mux.HandleFunc("POST /api/hid/events/send_mouse_move", f.routeMouseMove)
+	mux.HandleFunc("POST /api/hid/events/send_mouse_button", f.routeMouseButton)
+	mux.HandleFunc("POST /api/hid/events/send_mouse_wheel", f.routeMouseWheel)
+	mux.HandleFunc("POST /api/hid/events/send_mouse_relative", f.routeMouseRelative)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -389,6 +400,53 @@ func (f *Server) routeFlashEDID(w http.ResponseWriter, r *http.Request) {
 	}
 	f.EDID = strings.ToLower(stripped)
 	ok(w, map[string]any{"status": "success", "message": "EDID data has been written and applied"})
+}
+
+func (f *Server) routeHID(w http.ResponseWriter, r *http.Request) {
+	ok(w, f.hidDoc)
+}
+
+func (f *Server) routeSendKey(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	if !keys.Names[key] {
+		fail(w, http.StatusBadRequest, "ValidatorError", fmt.Sprintf("invalid key %q", key))
+		return
+	}
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeSendShortcut(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("keys")
+	for _, k := range strings.Split(raw, ",") {
+		if k == "" {
+			continue
+		}
+		if !keys.Names[k] {
+			fail(w, http.StatusBadRequest, "ValidatorError", fmt.Sprintf("invalid key %q", k))
+			return
+		}
+	}
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routePrint(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMouseMove(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMouseButton(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMouseWheel(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
+}
+
+func (f *Server) routeMouseRelative(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{})
 }
 
 // stripWhitespace removes spaces, tabs, and newlines from s.
