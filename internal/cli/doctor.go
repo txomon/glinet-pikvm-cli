@@ -180,9 +180,21 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 
 	if reachErr := c.Reach(ctx); reachErr != nil {
 		addCheck(&checks, &failedNames, "reach", false, reachErr.Error(), true)
-	} else {
-		addCheck(&checks, &failedNames, "reach", true, reachDetail(d.URL), true)
+		// A blackholed address can take the full per-request timeout to
+		// fail; calling every later check anyway would multiply that wait
+		// by up to 9x for a report that was always going to fail regardless.
+		// Every remaining check still gets its entry, in order, so the
+		// report always has all 10, matching the no-usable-device-config
+		// path above.
+		for _, name := range []string{"auth", "version", "switch", "capture", "hid", "msd"} {
+			addCheck(&checks, &failedNames, name, false, "skipped: reach failed", true)
+		}
+		for _, name := range []string{"otg", "mouse"} {
+			addCheck(&checks, &failedNames, name, false, "skipped: reach failed", false)
+		}
+		return checks, doctorErr(failedNames)
 	}
+	addCheck(&checks, &failedNames, "reach", true, reachDetail(d.URL), true)
 
 	if _, authErr := c.Info(ctx); authErr != nil {
 		addCheck(&checks, &failedNames, "auth", false, authErr.Error(), true)
