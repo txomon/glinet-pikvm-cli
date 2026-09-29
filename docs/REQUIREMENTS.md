@@ -145,7 +145,7 @@ verb per operation, `--output=json` everywhere, `--file` for images.
 * `set_active?port=1.N` selects host N; a bare integer is a 0-based index. Switch plus
   capture settle takes about 3s. `set_active_next`/`prev` apply synchronously and do not
   wrap past port 4 or port 1.
-* Port map: 1 gandalf (USB not attached), 2 unknown, 3 durin, 4 pippin. Keys and mouse go to
+* Port map: 1 gandalf (USB not attached), 2 theoden, 3 durin, 4 pippin. Keys and mouse go to
   the active port. Typing at durin's getty showed nothing although its USB link is up; cause
   not investigated, likely on durin.
 * After an EDID flash the host renegotiates for about 6s: `hdmi.signal` drops,
