@@ -64,14 +64,27 @@ type MSDDrive struct {
 }
 
 // MSDState mirrors the mass-storage state in msd.json, backed by an
-// in-memory image store keyed by name.
+// in-memory image store keyed by name. Online is not stored directly: the
+// real device (and this fake) only serves the selected image to the host
+// while the OTG start_cdrom function is on, so routeMSD reports it from
+// Server.OTG.StartCDROM instead.
 type MSDState struct {
 	Enabled bool
-	Online  bool
 	Busy    bool
 	Drive   MSDDrive
 	Images  map[string]*MSDImage
 	Free    int64
+}
+
+// OTGState mirrors GET /system/otg_functions, restricted to the fields this
+// fake models: which of the two GL-controlled functions are on, whether an
+// apply is in progress, and the outcome of the last one.
+type OTGState struct {
+	StartCDROM bool
+	StartFlash bool
+	Ready      bool
+	Applying   bool
+	ApplyError string
 }
 
 // Server is an in-process fake kvmd. Construct with New; it starts an
@@ -106,7 +119,14 @@ type Server struct {
 	EDIDPresets    []map[string]any
 	SnapshotJPEG   []byte
 	MSD            MSDState
+	OTG            OTGState
 	FailNext       map[string]Failure
+
+	// otgFailNext, when non-empty, is consumed by the next POST
+	// /system/otg_functions: it reports this as that apply's apply_error
+	// (and clears itself), instead of the usual empty string. Set through
+	// FailOTGApply.
+	otgFailNext string
 
 	// failOn is a call-indexed complement to FailNext, set through FailOn:
 	// it fails the n-th call (1-based) to a path, leaving every other call
@@ -173,7 +193,6 @@ func New(t testing.TB) *Server {
 
 	msdDoc := loadResult("msd")
 	msdEnabled, _ := msdDoc["enabled"].(bool)
-	msdOnline, _ := msdDoc["online"].(bool)
 	msdBusy, _ := msdDoc["busy"].(bool)
 	msdStorageDoc, _ := msdDoc["storage"].(map[string]any)
 	msdPartsDoc, _ := msdStorageDoc["parts"].(map[string]any)
@@ -203,12 +222,14 @@ func New(t testing.TB) *Server {
 		EDIDPresets:    loadArray("upgrade_edid_list"),
 		MSD: MSDState{
 			Enabled: msdEnabled,
-			Online:  msdOnline,
 			Busy:    msdBusy,
 			Drive:   MSDDrive{CDROM: msdCDROM, Connected: false, Image: "", RW: msdRW},
 			Images:  map[string]*MSDImage{},
 			Free:    int64(msdFree),
 		},
+		// start_cdrom off by default, matching the real device's factory
+		// setting and msd.json's captured "online": false.
+		OTG:        OTGState{StartCDROM: false, StartFlash: false, Ready: true, Applying: false},
 		FailNext:   map[string]Failure{},
 		failOn:     map[string][]failOnEntry{},
 		callCounts: map[string]int{},
@@ -274,6 +295,16 @@ func (f *Server) FailOn(path string, n int, failure Failure) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failOn[path] = append(f.failOn[path], failOnEntry{n: n, failure: failure})
+}
+
+// FailOTGApply arranges for the next POST /system/otg_functions to report
+// msg as that apply's apply_error, once; the request itself still succeeds
+// (status 200), matching the real device reporting a failed apply through
+// the state, not the POST's own response.
+func (f *Server) FailOTGApply(msg string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.otgFailNext = msg
 }
 
 // SetMouseAbsolute flips the fake's reported hid.mouse.absolute flag, for
@@ -360,6 +391,8 @@ func (f *Server) newMux() http.Handler {
 	mux.HandleFunc("POST /api/msd/set_params", f.routeMSDSetParams)
 	mux.HandleFunc("POST /api/msd/set_connected", f.routeMSDSetConnected)
 	mux.HandleFunc("POST /api/msd/remove", f.routeMSDRemove)
+	mux.HandleFunc("GET /api/system/otg_functions", f.routeOTGFunctionsGet)
+	mux.HandleFunc("POST /api/system/otg_functions", f.routeOTGFunctionsSet)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -606,7 +639,7 @@ func (f *Server) routeMSD(w http.ResponseWriter, r *http.Request) {
 
 	ok(w, map[string]any{
 		"enabled": f.MSD.Enabled,
-		"online":  f.MSD.Online,
+		"online":  f.OTG.StartCDROM,
 		"busy":    f.MSD.Busy,
 		"drive": map[string]any{
 			"cdrom":     f.MSD.Drive.CDROM,
@@ -693,6 +726,60 @@ func (f *Server) routeMSDRemove(w http.ResponseWriter, r *http.Request) {
 		f.MSD.Drive.Image = ""
 	}
 	ok(w, map[string]any{})
+}
+
+// otgFunctionsDoc renders the fake's OTG state as the full field set GET
+// /system/otg_functions reports. The enable_* flags are not modeled by this
+// fake (nothing here changes them); their values match the real device's
+// capture.
+func (f *Server) otgFunctionsDoc() map[string]any {
+	var applyError any
+	if f.OTG.ApplyError != "" {
+		applyError = f.OTG.ApplyError
+	}
+	return map[string]any{
+		"apply_error":      applyError,
+		"applying":         f.OTG.Applying,
+		"enable_camera":    false,
+		"enable_keyboard":  true,
+		"enable_mic":       false,
+		"enable_mouse":     true,
+		"enable_mouse_alt": true,
+		"enable_mtp":       false,
+		"ready":            f.OTG.Ready,
+		"start_cdrom":      f.OTG.StartCDROM,
+		"start_flash":      f.OTG.StartFlash,
+	}
+}
+
+func (f *Server) routeOTGFunctionsGet(w http.ResponseWriter, r *http.Request) {
+	ok(w, f.otgFunctionsDoc())
+}
+
+// routeOTGFunctionsSet applies whichever of start_cdrom/start_flash the
+// query names (booleans as "true"/"false"), settles the apply immediately
+// (ready=true, applying=false: this fake never models a transient applying
+// window), and reports otgFailNext as this apply's error, if one was queued
+// by FailOTGApply, clearing it either way. The response omits
+// apply_error/applying/ready, matching the real device.
+func (f *Server) routeOTGFunctionsSet(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if v := q.Get("start_cdrom"); v != "" {
+		f.OTG.StartCDROM = v == "true"
+	}
+	if v := q.Get("start_flash"); v != "" {
+		f.OTG.StartFlash = v == "true"
+	}
+	f.OTG.ApplyError = f.otgFailNext
+	f.otgFailNext = ""
+	f.OTG.Ready = true
+	f.OTG.Applying = false
+
+	doc := f.otgFunctionsDoc()
+	delete(doc, "apply_error")
+	delete(doc, "applying")
+	delete(doc, "ready")
+	ok(w, doc)
 }
 
 // stripWhitespace removes spaces, tabs, and newlines from s.

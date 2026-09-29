@@ -137,6 +137,7 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newKeyCmd(g))
 	root.AddCommand(newTypeCmd(g))
 	root.AddCommand(newMouseCmd(g))
+	root.AddCommand(newMSDCmd(g))
 
 	return root
 }
