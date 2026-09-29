@@ -716,16 +716,15 @@ func newConfigDeviceShowCmd(g *globals) *cobra.Command {
 		return nil
 	}
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		f, err := config.Load(g.configPath)
+		// LoadBoth reads the file once and derives both the typed and raw
+		// views from that single snapshot, so a write landing between two
+		// separate reads can never make show report a mix of before/after
+		// state.
+		f, rawFile, err := config.LoadBoth(g.configPath)
 		if err != nil {
 			return err
 		}
 		d, err := f.Lookup(args[0])
-		if err != nil {
-			return err
-		}
-
-		rawFile, err := config.LoadRaw(g.configPath)
 		if err != nil {
 			return err
 		}

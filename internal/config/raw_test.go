@@ -302,6 +302,90 @@ func TestWithLockedSymlinkToReadOnlyTargetFailsLoudly(t *testing.T) {
 	}
 }
 
+// TestWithLockedDanglingSymlinkWritesAtTarget pins the behavior for a
+// symlink whose target does not exist yet (dangling): the write creates the
+// target (its parent directory must already exist) and leaves the symlink
+// itself in place, pointing at the same (now real) target, exactly like a
+// symlink to an existing file.
+func TestWithLockedDanglingSymlinkWritesAtTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-config.json")
+	linkPath := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("target should not exist yet: err=%v", err)
+	}
+
+	changed, err := WithLocked(linkPath, func(rf *RawFile) (*RawFile, error) {
+		rf.Devices["a"] = RawDevice{"url": rawString("https://a.example")}
+		return rf, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("want changed true")
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was replaced with a regular file")
+	}
+	got, err := os.Readlink(linkPath)
+	if err != nil || got != target {
+		t.Fatalf("symlink now points to %q, want %q (err %v)", got, target, err)
+	}
+
+	b, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"a"`) {
+		t.Fatalf("target was not created with the write's content: %s", b)
+	}
+}
+
+// TestWithLockedDanglingSymlinkMissingTargetDirFailsLoudly pins the other
+// half: when the dangling symlink's target lives in a directory that does
+// not exist, the write fails as ErrConfig naming the target, rather than
+// silently falling back to clobbering the symlink itself.
+func TestWithLockedDanglingSymlinkMissingTargetDirFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "no-such-dir", "real-config.json")
+	linkPath := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := WithLocked(linkPath, func(rf *RawFile) (*RawFile, error) {
+		rf.Devices["a"] = RawDevice{"url": rawString("https://a.example")}
+		return rf, nil
+	})
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("want ErrConfig, got %v", err)
+	}
+	if !strings.Contains(err.Error(), target) {
+		t.Fatalf("error %v does not name the target %s", err, target)
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was replaced despite the failed write")
+	}
+	got, err := os.Readlink(linkPath)
+	if err != nil || got != target {
+		t.Fatalf("symlink target changed: %q, %v", got, err)
+	}
+}
+
 // TestWithLockedNoOpOnMissingFileDoesNotCreateIt pins the "remove
 // --if-exists on a config file that doesn't exist yet" fix: fn returning
 // the RawFile unchanged (LoadRaw's own empty result) must compare equal to
