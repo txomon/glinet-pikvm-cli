@@ -36,6 +36,8 @@ even when the failure is an unreadable config).
 
 ```
 ./dev go build -o glkvm ./cmd/glkvm
+# one-time per clone: commits then refuse to land unless gofmt, vet and tests pass
+git config core.hooksPath .githooks
 ```
 
 Never build Go on the host; `./dev` runs the pinned container. Verify the result is

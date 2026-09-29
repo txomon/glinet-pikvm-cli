@@ -1,0 +1,12 @@
+#!/bin/sh
+# Block a commit when formatting, vet or tests fail. Runs Go in the container via ./dev.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+unformatted=$(./dev gofmt -l cmd internal)
+if [ -n "$unformatted" ]; then
+  echo "pre-commit: gofmt needed on:" >&2
+  echo "$unformatted" >&2
+  exit 1
+fi
+./dev go vet ./...
+./dev go test -count=1 ./...
