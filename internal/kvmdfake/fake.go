@@ -727,6 +727,12 @@ func (f *Server) routeMSDWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.MSD.Images[name] = &MSDImage{Data: body, Complete: true, ModTS: float64(time.Now().UnixNano()) / 1e9}
+	// A pending delayed removal for this exact name must not survive a
+	// fresh write: without this, a name just freed by a delayed remove and
+	// immediately reused by a write (as msd upload --replace does) would
+	// have its brand new image deleted out from under it once the old
+	// removal's countdown reaches zero.
+	delete(f.msdPendingRemove, name)
 	if f.MSDWriteDelayPolls > 0 {
 		f.msdPendingHide[name] = f.MSDWriteDelayPolls
 	} else {

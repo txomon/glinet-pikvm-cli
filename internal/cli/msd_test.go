@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/txomon/glinet-pikvm-cli/internal/kvmd"
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmdfake"
 )
 
@@ -381,5 +383,79 @@ func TestMSDUploadTimesOutWhenStorageNeverCatchesUp(t *testing.T) {
 	_, stderr, code := runCLI(t, f, "msd", "upload", p)
 	if code == 0 || !strings.Contains(stderr, "did not appear complete") {
 		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+// TestMSDUploadReplaceWithDelayedRemoval pins fix round 2's finding: live,
+// "msd upload --replace" over an existing name failed with kvmd's
+// MsdImageExistsError because the replace path removed and wrote right
+// away, while kvmd's storage view still listed the old image for about a
+// second. --replace must wait for the removal to be confirmed gone (the
+// same removeAndConfirm doMSDRemove uses) before writing the new image
+// under that name.
+func TestMSDUploadReplaceWithDelayedRemoval(t *testing.T) {
+	f := kvmdfake.New(t)
+	p1 := writeImage(t, "a.img")
+	if _, e, code := runCLI(t, f, "msd", "upload", p1); code != 0 {
+		t.Fatalf("initial upload: code %d %s", code, e)
+	}
+
+	f.MSDRemoveDelayPolls = 2
+	p2 := filepath.Join(t.TempDir(), "newer.img")
+	if err := os.WriteFile(p2, []byte("yyyy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := runCLI(t, f, "msd", "upload", p2, "--name", "a.img", "--replace", "-o", "json")
+	if code != 0 {
+		t.Fatalf("replace upload: code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(out, `"replaced": true`) || !strings.Contains(out, `"size": 4`) {
+		t.Fatalf("out %s", out)
+	}
+}
+
+// TestMSDWriteClearsPendingRemove pins the fake-only half of fix round 2:
+// routeMSDWrite must clear any msdPendingRemove entry for the name it
+// writes. Without it, a name freed by a delayed removal and immediately
+// reused by a write would have its brand new data deleted once the old
+// removal's countdown reaches zero on a later, unrelated poll. This uses a
+// raw kvmd.Client (not doMSDUpload/doMSDRemove) to bypass their
+// removeAndConfirm wait deliberately: that wait already keeps the CLI from
+// ever writing while a removal is still pending, so this test is only about
+// the fake's own correctness for any caller that does not wait.
+func TestMSDWriteClearsPendingRemove(t *testing.T) {
+	ctx := context.Background()
+	f := kvmdfake.New(t)
+	c := kvmd.New(f.Device(), 5*time.Second)
+
+	first := []byte("first")
+	if err := c.MSDUpload(ctx, "a.img", bytes.NewReader(first), int64(len(first))); err != nil {
+		t.Fatal(err)
+	}
+
+	f.MSDRemoveDelayPolls = 2
+	if err := c.MSDRemove(ctx, "a.img"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reuse the name right away, without waiting for the delayed removal to
+	// actually take effect in the fake.
+	second := []byte("second")
+	if err := c.MSDUpload(ctx, "a.img", bytes.NewReader(second), int64(len(second))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exhaust the old removal's countdown (2 polls) with a margin, and
+	// confirm the freshly written image survives every one of them.
+	for i := 0; i < 4; i++ {
+		st, err := c.MSD(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, ok := st.Images["a.img"]
+		if !ok || img.Size != int64(len(second)) {
+			t.Fatalf("poll %d: image missing or wrong size, got %+v (present=%v)", i, img, ok)
+		}
 	}
 }

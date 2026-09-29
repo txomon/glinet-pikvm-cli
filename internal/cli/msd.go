@@ -265,9 +265,14 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // doMSDUpload uploads the file at path as name (default: path's base name)
 // into the device's image storage. It refuses a name collision unless
-// replace is set, which removes the existing image first (itself refused
-// while that image is the connected one), and checks free space before
-// opening the file. report, when non-nil, is called with the cumulative
+// replace is set, which removes the existing image through removeAndConfirm
+// first (itself refused while that image is the connected one) and checks
+// free space before opening the file. The removal must be confirmed, not
+// just requested, before the write: live, uploading over an existing name
+// right after asking the device to remove it failed with
+// MsdImageExistsError, because kvmd's storage view still listed the old
+// image for about a second after the remove call had already succeeded.
+// report, when non-nil, is called with the cumulative
 // percent complete every 5%. After the upload completes, it polls the
 // device's storage listing every waitPollInterval until the image is listed
 // complete with the uploaded size, erroring if that never happens within
@@ -292,7 +297,7 @@ func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace
 		if st.Drive.Connected && st.Drive.Image == name {
 			return msdUploadResult{}, usagef("cannot replace %q: it is the connected image, detach first", name)
 		}
-		if err := c.MSDRemove(ctx, name); err != nil {
+		if err := removeAndConfirm(ctx, c, name); err != nil {
 			return msdUploadResult{}, err
 		}
 		replaced = true
@@ -339,24 +344,19 @@ func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace
 	return msdUploadResult{Name: name, Size: size, Replaced: replaced}, nil
 }
 
-// doMSDRemove deletes name from the device's image storage, refusing when
-// it is the connected image, then confirms the removal landed: kvmd's
-// storage listing has been observed to keep reporting a just-removed image
-// for a few seconds after the remove call already succeeded, so this polls
-// the listing every waitPollInterval until the image is gone, erroring if it
-// never disappears within msdConfirmTimeout. It is a plain function, not a
-// cobra RunE, so other callers can use it without cobra.
-func doMSDRemove(ctx context.Context, c *kvmd.Client, name string) (msdRemoveResult, error) {
-	st, err := c.MSD(ctx)
-	if err != nil {
-		return msdRemoveResult{}, err
-	}
-	if st.Drive.Connected && st.Drive.Image == name {
-		return msdRemoveResult{}, usagef("%q is the connected image; detach first", name)
-	}
-
+// removeAndConfirm deletes name from the device's image storage, then polls
+// the storage listing every waitPollInterval until the image is gone,
+// erroring if it never disappears within msdConfirmTimeout: kvmd's storage
+// listing has been observed to keep reporting a just-removed image for a
+// few seconds after the remove call already succeeded. Any caller-side
+// usage checks (such as refusing to remove the connected image) are the
+// caller's job; this only wraps the device call and the confirm-wait shared
+// by doMSDRemove and doMSDUpload's --replace path (which must confirm the
+// old image is really gone before writing the new one under the same name,
+// or the write can fail live with MsdImageExistsError against the same lag).
+func removeAndConfirm(ctx context.Context, c *kvmd.Client, name string) error {
 	if err := c.MSDRemove(ctx, name); err != nil {
-		return msdRemoveResult{}, err
+		return err
 	}
 
 	confirmCtx, cancel := context.WithTimeout(ctx, msdConfirmTimeout)
@@ -370,7 +370,26 @@ func doMSDRemove(ctx context.Context, c *kvmd.Client, name string) (msdRemoveRes
 		return !present, nil
 	})
 	if waitErr != nil {
-		return msdRemoveResult{}, fmt.Errorf("image %q still listed in storage %s after removal: %w", name, msdConfirmTimeout, waitErr)
+		return fmt.Errorf("image %q still listed in storage %s after removal: %w", name, msdConfirmTimeout, waitErr)
+	}
+	return nil
+}
+
+// doMSDRemove deletes name from the device's image storage, refusing when
+// it is the connected image, then confirms the removal landed (see
+// removeAndConfirm). It is a plain function, not a cobra RunE, so other
+// callers can use it without cobra.
+func doMSDRemove(ctx context.Context, c *kvmd.Client, name string) (msdRemoveResult, error) {
+	st, err := c.MSD(ctx)
+	if err != nil {
+		return msdRemoveResult{}, err
+	}
+	if st.Drive.Connected && st.Drive.Image == name {
+		return msdRemoveResult{}, usagef("%q is the connected image; detach first", name)
+	}
+
+	if err := removeAndConfirm(ctx, c, name); err != nil {
+		return msdRemoveResult{}, err
 	}
 
 	return msdRemoveResult{Removed: name}, nil
