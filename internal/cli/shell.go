@@ -238,13 +238,35 @@ type shellCommandResult struct {
 	Output   string `json:"output"`
 }
 
+// markerPrefix is the fixed half of every marker, kept separate from the
+// per-run nonce (see buildShellScript) so it never appears as one
+// contiguous string in the input glkvm itself sends.
+const markerPrefix = "__GLKVM_"
+
 // buildShellScript wraps cmd in a subshell, so an "exit" inside cmd ends
 // only that subshell (leaving $? as cmd's own status) instead of the whole
 // remote session, which would otherwise skip the trailing marker/exit
-// lines. stty -echo (2>/dev/null, since the fake's plain pipe is not a tty)
-// and blank PS1/PS2 keep the remote session's own noise out of the way.
-func buildShellScript(start, end, cmd string) string {
-	return fmt.Sprintf("stty -echo 2>/dev/null; PS1=; PS2=\necho %s\n( %s )\necho %s$?\nexit\n", start, cmd, end)
+// lines.
+//
+// The remote is a real pty: the terminal echoes input back as it arrives,
+// including whatever glkvm is about to send, before "stty -echo" (kept
+// below as a best effort) has any chance to take effect. If the marker text
+// ever appeared literally in that sent input, the echo of glkvm's own
+// script would contain a complete marker, and the scanner (which cannot
+// tell an echoed input line from real command output) would match it
+// there, well before the real command has even run. To avoid that, each
+// marker is never sent as one contiguous string: it is built on the remote
+// side, at runtime, by a printf joining two pieces that are passed as
+// separate, space-separated words. The joined marker then exists only in
+// printf's own output, never in anything glkvm wrote to the socket.
+func buildShellScript(nonce, cmd string) string {
+	var b strings.Builder
+	b.WriteString("stty -echo 2>/dev/null; PS1=; PS2=\n")
+	b.WriteString(`printf '%s%s\n' ` + markerPrefix + " S_" + nonce + "\n")
+	b.WriteString("( " + cmd + " )\n")
+	b.WriteString(`printf '%s%s:%d\n' ` + markerPrefix + " E_" + nonce + ` "$?"` + "\n")
+	b.WriteString("exit\n")
+	return b.String()
 }
 
 // runShellCommand runs cmd on the remote shell over conn, writing its
@@ -252,14 +274,18 @@ func buildShellScript(start, end, cmd string) string {
 // alongside that same output collected as a string (for json mode's
 // envelope). ctx bounds the whole run.
 func runShellCommand(ctx context.Context, conn webtermConn, cmd string, out io.Writer) (shellCommandResult, error) {
-	token, err := randomToken()
+	nonce, err := randomToken()
 	if err != nil {
 		return shellCommandResult{}, err
 	}
-	start := "GLKVM_START_" + token
-	end := "GLKVM_END_" + token
+	// These are the marker strings as they appear in printf's own output
+	// (the two pieces joined with no separator): what the scanner searches
+	// for. end includes the trailing ':' that separates it from the exit
+	// status digits printf appends right after.
+	start := markerPrefix + "S_" + nonce
+	end := markerPrefix + "E_" + nonce + ":"
 
-	if _, err := conn.Write([]byte(buildShellScript(start, end, cmd))); err != nil {
+	if _, err := conn.Write([]byte(buildShellScript(nonce, cmd))); err != nil {
 		return shellCommandResult{}, fmt.Errorf("shell: send command: %w", err)
 	}
 

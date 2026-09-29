@@ -181,6 +181,21 @@ type Server struct {
 	// received afterward, in order. Both are set by handleWebterm.
 	WebtermHandshake WebtermSize
 	WebtermResizes   []WebtermSize
+	// WebtermEcho, true by default (matching the real device: ttyd always
+	// runs a real pty, which echoes input back as output until, and
+	// sometimes despite, "stty -echo"), makes handleWebterm write every
+	// input frame back as output before passing it to the child, CRLF
+	// converted like a real tty's echo. Set to false with SetWebtermEcho
+	// for a test that wants clean output instead.
+	WebtermEcho bool
+}
+
+// SetWebtermEcho overrides the default (on) pty-echo simulation on the
+// webterm bridge. Call it before dialing.
+func (f *Server) SetWebtermEcho(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.WebtermEcho = on
 }
 
 // WebtermSize is a terminal size recorded by the webterm bridge, either from
@@ -283,6 +298,8 @@ func New(t testing.TB) *Server {
 		infoDoc:    loadResult("info"),
 		versionDoc: loadResult("upgrade_version"),
 		hidDoc:     loadResult("hid"),
+
+		WebtermEcho: true,
 	}
 	f.SnapshotJPEG = generateSnapshot(f.Width, f.Height)
 

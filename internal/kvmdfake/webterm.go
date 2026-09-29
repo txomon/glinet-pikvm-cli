@@ -1,6 +1,7 @@
 package kvmdfake
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -64,6 +65,7 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 	}
 	f.mu.Lock()
 	f.WebtermHandshake = WebtermSize{Columns: hs.Columns, Rows: hs.Rows}
+	echo := f.WebtermEcho
 	f.mu.Unlock()
 
 	// Title, then a motd line: this fake's stand-in for the real device's
@@ -110,6 +112,18 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 			}
 			switch data[0] {
 			case '0':
+				if echo {
+					// A real pty echoes input back as output, CRLF
+					// converted, before (and regardless of whether) the
+					// shell has processed it: this is what let a marker
+					// sent as one literal contiguous string leak into the
+					// output stream as if it were real command output (the
+					// bug this echo mode exists to catch in tests). Errors
+					// writing the echo are ignored: a lost echo frame does
+					// not stop the session, unlike a lost real frame below.
+					echoed := append([]byte{'0'}, bytes.ReplaceAll(data[1:], []byte("\n"), []byte("\r\n"))...)
+					_ = conn.Write(ctx, websocket.MessageBinary, echoed)
+				}
 				if _, err := stdin.Write(data[1:]); err != nil {
 					return
 				}

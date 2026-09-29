@@ -254,3 +254,51 @@ func TestShellCommandTimeout(t *testing.T) {
 		t.Fatalf("code %d stderr %q", code, stderr)
 	}
 }
+
+// TestShellCommandRealPTYEchoRegression pins the fix for a bug found on a
+// live run: the real device's webterm is a real pty, which echoes back
+// whatever glkvm sends before "stty -echo" can take effect. The old marker
+// scheme sent the marker text itself ("echo GLKVM_START_xxx"), so that
+// echoed input line contained a complete marker; the scanner (which cannot
+// tell echoed input from real command output) matched it there, capturing
+// the echoed command line as if it were output, and reading the literal,
+// unexpanded "$?" out of the echoed end-marker line as the exit status,
+// which failed to parse. kvmdfake's default WebtermEcho (on) reproduces
+// that echo; this test would have failed on the old scheme with exactly
+// the reported symptom ("parse remote exit status \"$?\": ... invalid
+// syntax") and now exercises the fix (markers built at runtime from
+// space-separated pieces, so they never appear literally in sent input).
+func TestShellCommandRealPTYEchoRegression(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.SetWebtermEcho(true) // explicit: this is also the default
+
+	out, stderr, code := runCLI(t, f, "shell", "-c", "echo one; echo two; exit 7")
+	if code != 7 {
+		t.Fatalf("code %d out %q stderr %q", code, out, stderr)
+	}
+	if out != "one\ntwo\n" {
+		t.Fatalf("out = %q", out)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+}
+
+// TestShellCommandEchoDisabled exercises the SetWebtermEcho(false) knob:
+// output is exactly the same either way, since the marker scheme no longer
+// depends on echo being off.
+func TestShellCommandEchoDisabled(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.SetWebtermEcho(false)
+
+	out, stderr, code := runCLI(t, f, "shell", "-c", "echo one; echo two; exit 7")
+	if code != 7 {
+		t.Fatalf("code %d out %q stderr %q", code, out, stderr)
+	}
+	if out != "one\ntwo\n" {
+		t.Fatalf("out = %q", out)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+}
