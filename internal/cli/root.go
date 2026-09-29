@@ -110,7 +110,7 @@ func noArgs(cmd *cobra.Command, args []string) error {
 
 // newRoot builds the root command. Later tasks hang their subcommands off
 // the returned command via root.AddCommand.
-func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
+func newRoot(g *globals, stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "glkvm",
 		Short:         "Drive a GL.iNet Comet X KVM over its HTTP API",
@@ -118,6 +118,7 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 		SilenceErrors: true,
 		Args:          noArgs,
 	}
+	root.SetIn(stdin)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 
@@ -160,6 +161,7 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newDevicesCmd(g))
 	root.AddCommand(newDoctorCmd(g))
 	root.AddCommand(newShellCmd(g))
+	root.AddCommand(newConfigCmd(g))
 
 	return root
 }
@@ -183,9 +185,9 @@ func newVersionCmd(g *globals) *cobra.Command {
 // Execute runs the CLI for args (excluding the program name) and returns the
 // process exit code. JSON errors are written to stdout, text errors to
 // stderr, matching where their corresponding success output goes.
-func Execute(args []string, stdout, stderr io.Writer) int {
+func Execute(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	g := &globals{}
-	root := newRoot(g, stdout, stderr)
+	root := newRoot(g, stdin, stdout, stderr)
 	root.SetArgs(args)
 
 	err := root.Execute()

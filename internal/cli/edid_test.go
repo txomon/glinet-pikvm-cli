@@ -78,7 +78,7 @@ func TestEdidValidateOffline(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "e.hex")
 	_ = os.WriteFile(p, []byte(edid.ChromebookHex), 0o600)
 	var out, errb strings.Builder
-	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", p}, &out, &errb)
+	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", p}, strings.NewReader(""), &out, &errb)
 	if code != 0 || !strings.Contains(out.String(), "1200x752") {
 		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
 	}
@@ -132,7 +132,7 @@ func TestEdidSetFileBareBaseBlock(t *testing.T) {
 func TestEdidValidateMissingFileIsUsageError(t *testing.T) {
 	var out, errb strings.Builder
 	missing := filepath.Join(t.TempDir(), "nope.hex")
-	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", missing}, &out, &errb)
+	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", missing}, strings.NewReader(""), &out, &errb)
 	if code != ExitUsage {
 		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
 	}

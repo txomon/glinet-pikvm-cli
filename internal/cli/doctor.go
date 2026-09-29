@@ -13,61 +13,6 @@ import (
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmd"
 )
 
-// --- devices ---
-
-// deviceEntry is one configured device in glkvm devices' result. It never
-// includes the password.
-type deviceEntry struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Default bool   `json:"default"`
-}
-
-// devicesFromFile lists f's configured devices, sorted by name, marking
-// which one default_device names.
-func devicesFromFile(f *config.File) []deviceEntry {
-	names := f.Names()
-	entries := make([]deviceEntry, 0, len(names))
-	for _, name := range names {
-		entries = append(entries, deviceEntry{
-			Name:    name,
-			URL:     f.Devices[name].URL,
-			Default: name == f.DefaultDevice,
-		})
-	}
-	return entries
-}
-
-func newDevicesCmd(g *globals) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:           "devices",
-		Short:         "List configured devices",
-		Args:          noArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-	}
-	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		f, err := config.Load(g.configPath)
-		if err != nil {
-			return err
-		}
-		if w := config.PermWarning(g.configPath); w != "" {
-			fmt.Fprintln(cmd.ErrOrStderr(), w)
-		}
-		entries := devicesFromFile(f)
-		return render(cmd.OutOrStdout(), g.output, entries, func(w io.Writer) {
-			for _, e := range entries {
-				mark := " "
-				if e.Default {
-					mark = "*"
-				}
-				fmt.Fprintf(w, "%s %-16s %s\n", mark, e.Name, e.URL)
-			}
-		})
-	}
-	return cmd
-}
-
 // --- doctor ---
 
 // doctorCheck is one named check in glkvm doctor's ordered report.
