@@ -84,6 +84,69 @@ func TestEdidValidateOffline(t *testing.T) {
 	}
 }
 
+// TestEdidSetFileBareBaseBlock pins fix round 3's finding 3: flashing a bare
+// 128-byte (256 hex char) EDID gets a stock CEA extension appended by the
+// device (verified live), so get_edid reads back 512 chars afterward. "edid
+// set --file" must compare only the first 256 chars against a 256-char
+// newHex, both for the unchanged check and the post-flash read-back, or the
+// read-back never matches and a second identical set never reports
+// changed=false.
+func TestEdidSetFileBareBaseBlock(t *testing.T) {
+	f := kvmdfake.New(t)
+	// The fake starts already flashed with the full chromebook edid (base
+	// block plus extension), so a bare base block identical to it would
+	// report changed=false immediately. Flip the harmless week-of-manufacture
+	// byte (offset 16) so this base block actually differs, then fix up the
+	// checksum that patch invalidates.
+	b := []byte(edid.ChromebookHex[:256])
+	b[32], b[33] = '0', '9'
+	baseBlock := fixChecksum(t, string(b))
+	p := filepath.Join(t.TempDir(), "base.hex")
+	if err := os.WriteFile(p, []byte(baseBlock), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := runCLI(t, f, "edid", "set", "--file", p, "--settle", "50ms", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d out %s stderr %s", code, out, stderr)
+	}
+	if !strings.Contains(out, `"changed": true`) {
+		t.Fatalf("first set should report changed true: out %s", out)
+	}
+	if got := f.CurrentEDID(); len(got) != 512 || !strings.HasPrefix(got, baseBlock) {
+		t.Fatalf("device edid %q did not get a 512-char extension appended", got)
+	}
+
+	out2, stderr2, code2 := runCLI(t, f, "edid", "set", "--file", p, "--settle", "50ms", "-o", "json")
+	if code2 != 0 {
+		t.Fatalf("second set: code %d out %s stderr %s", code2, out2, stderr2)
+	}
+	if !strings.Contains(out2, `"changed": false`) {
+		t.Fatalf("second identical set should report changed false: out %s", out2)
+	}
+}
+
+// TestEdidValidateMissingFileIsUsageError and TestEdidSetMissingFileIsUsageError
+// pin fix round 3's finding 10: a missing local file is a usage error (exit
+// 2), not a device error.
+func TestEdidValidateMissingFileIsUsageError(t *testing.T) {
+	var out, errb strings.Builder
+	missing := filepath.Join(t.TempDir(), "nope.hex")
+	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", missing}, &out, &errb)
+	if code != ExitUsage {
+		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
+	}
+}
+
+func TestEdidSetMissingFileIsUsageError(t *testing.T) {
+	f := kvmdfake.New(t)
+	missing := filepath.Join(t.TempDir(), "nope.hex")
+	_, stderr, code := runCLI(t, f, "edid", "set", "--file", missing)
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
 func TestEdidUnknownProfile(t *testing.T) {
 	_, _, code := runCLI(t, kvmdfake.New(t), "edid", "set", "8k")
 	if code != ExitUsage {

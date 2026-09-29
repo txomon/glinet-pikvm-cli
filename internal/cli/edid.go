@@ -64,7 +64,7 @@ func resolveEdidSetHex(profile, file string, presets []kvmd.EDIDPreset) (string,
 	if file != "" {
 		raw, err := os.ReadFile(file)
 		if err != nil {
-			return "", fmt.Errorf("read edid file %s: %w", file, err)
+			return "", usagef("read edid file %s: %v", file, err)
 		}
 		norm, err := edid.Normalize(string(raw))
 		if err != nil {
@@ -95,6 +95,19 @@ func captureVerdict(m edid.Mode) string {
 		return err.Error()
 	}
 	return "ok"
+}
+
+// edidMatches reports whether deviceHex represents the same EDID as newHex.
+// The device silently appends a stock 128-byte CEA extension to a bare
+// 128-byte (256 hex char) EDID it is asked to flash (verified live), so
+// get_edid then reads back 512 chars even though only the base block was
+// sent. When newHex is a bare 256-char base block, only deviceHex's own
+// first 256 chars are compared; otherwise the two are compared whole.
+func edidMatches(deviceHex, newHex string) bool {
+	if len(newHex) == 256 && len(deviceHex) >= 256 {
+		return deviceHex[:256] == newHex
+	}
+	return deviceHex == newHex
 }
 
 // doEdidShow gathers the flashed EDID's mode and matching profile, its
@@ -167,7 +180,7 @@ func doEdidSet(ctx context.Context, c *kvmd.Client, profile, file string, force 
 		return edidSetResult{}, err
 	}
 
-	changed := current != newHex
+	changed := !edidMatches(current, newHex)
 	if changed {
 		if err := c.FlashEDID(ctx, newHex); err != nil {
 			return edidSetResult{}, err
@@ -180,7 +193,7 @@ func doEdidSet(ctx context.Context, c *kvmd.Client, profile, file string, force 
 			if err != nil {
 				return false, err
 			}
-			return got == newHex, nil
+			return edidMatches(got, newHex), nil
 		}); err != nil {
 			return edidSetResult{}, fmt.Errorf("flashed edid did not read back within %s: %w", edidReadbackTimeout, err)
 		}
@@ -237,7 +250,7 @@ func doEdidSet(ctx context.Context, c *kvmd.Client, profile, file string, force 
 func doEdidValidate(filePath string) (edidValidateResult, error) {
 	raw, err := os.ReadFile(filePath)
 	if err != nil {
-		return edidValidateResult{}, fmt.Errorf("read edid file %s: %w", filePath, err)
+		return edidValidateResult{}, usagef("read edid file %s: %v", filePath, err)
 	}
 	norm, err := edid.Normalize(string(raw))
 	if err != nil {
