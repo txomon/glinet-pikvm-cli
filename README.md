@@ -45,6 +45,9 @@ file glkvm
 
 `glkvm` itself is gitignored; never commit the binary.
 
+CI runs gofmt, vet, a tidy check, race tests and static amd64/arm64 builds on every
+push and pull request.
+
 ## config
 
 `glkvm config` reads and writes the config file directly; none of its commands
