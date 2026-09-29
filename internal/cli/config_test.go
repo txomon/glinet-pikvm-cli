@@ -140,7 +140,7 @@ func TestConfigDeviceCreateRequiresExactlyOneURLSource(t *testing.T) {
 
 func TestConfigDeviceCreateInvalidURLRefused(t *testing.T) {
 	p := freshConfigPath(t)
-	for _, bad := range []string{"not-a-url", "ftp://x.example.net", "http://"} {
+	for _, bad := range []string{"not-a-url", "ftp://x.example.net", "http://", ""} {
 		_, stderr, code := runConfig(t, p, "", "config", "device", "create", "arwen", "--url", bad)
 		if code != ExitUsage {
 			t.Fatalf("%q: code %d stderr %s", bad, code, stderr)
@@ -148,6 +148,35 @@ func TestConfigDeviceCreateInvalidURLRefused(t *testing.T) {
 	}
 	if _, err := os.Stat(p); err == nil {
 		t.Fatal("config file should not have been created")
+	}
+}
+
+// TestConfigDeviceCreateEmptyURLIsNotMisroutedToURLFile pins a fixed bug: an
+// empty --url value (Changed("url") true, empty string) used to dispatch on
+// the value being non-empty rather than on the flag being given, so an
+// empty --url silently fell through to the url_file branch (storing an
+// empty url_file) instead of being refused by validateDeviceURL.
+func TestConfigDeviceCreateEmptyURLIsNotMisroutedToURLFile(t *testing.T) {
+	p := freshConfigPath(t)
+	_, stderr, code := runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "")
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Fatal("config file should not have been created")
+	}
+}
+
+func TestConfigDeviceSetEmptyURLRefused(t *testing.T) {
+	p := freshConfigPath(t)
+	runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
+	_, stderr, code := runConfig(t, p, "", "config", "device", "set", "arwen", "--url", "")
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	dev := deviceFromConfigFile(t, p, "arwen")
+	if dev["url"] != "https://arwen.example.net" {
+		t.Fatalf("device changed despite refusal: %+v", dev)
 	}
 }
 

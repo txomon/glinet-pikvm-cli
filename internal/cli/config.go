@@ -188,7 +188,7 @@ func newConfigDeviceCreateCmd(g *globals) *cobra.Command {
 		if f.Changed("password-file") && passwordStdin {
 			return usagef("give at most one of --password-file or --password-stdin")
 		}
-		if urlStr != "" {
+		if f.Changed("url") {
 			if err := validateDeviceURL(urlStr); err != nil {
 				return err
 			}
@@ -222,7 +222,7 @@ func newConfigDeviceCreateCmd(g *globals) *cobra.Command {
 			}
 
 			dev := config.RawDevice{}
-			if urlStr != "" {
+			if f.Changed("url") {
 				dev["url"] = rawString(urlStr)
 			} else {
 				dev["url_file"] = rawString(absURLFile)
@@ -299,7 +299,7 @@ func newConfigDeviceSetCmd(g *globals) *cobra.Command {
 		if f.Changed("password-file") && passwordStdin {
 			return usagef("give at most one of --password-file or --password-stdin")
 		}
-		if urlStr != "" && f.Changed("url") {
+		if f.Changed("url") {
 			if err := validateDeviceURL(urlStr); err != nil {
 				return err
 			}
