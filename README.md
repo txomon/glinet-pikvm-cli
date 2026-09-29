@@ -7,26 +7,20 @@ stderr (but does not refuse to run) if it is wider. Credentials never go in the 
 or on the command line: they live only in this file, or are overridden per invocation
 with `GLKVM_PASSWORD`.
 
-Config file, one entry per device, `default_device` used when `-d`/`--device` is
-omitted:
+`glkvm config device create` builds the config file for you, one device per name,
+`default_device` used when `-d`/`--device` is omitted:
 
-```json
-{
-  "devices": {
-    "arwen": {
-      "url": "https://arwen.example.net",
-      "user": "admin",
-      "password": "CHANGEME",
-      "insecure_tls": true
-    }
-  },
-  "default_device": "arwen"
-}
+```
+glkvm config device create arwen --url https://arwen.example.net --user admin --password-stdin --default
 ```
 
-`insecure_tls: true` skips certificate verification, needed for arwen's self-signed
-cert on the tailnet. Every command also takes `-o`/`--output text|json` (default
-text), `--config PATH`, and `--timeout` (default 15s, per request).
+(reads the password as one line from stdin; see `## config` below for every field,
+for storing secrets as separate files instead of inline, and for editing, listing
+and removing devices without touching the JSON by hand)
+
+`--insecure-tls` skips certificate verification, needed for arwen's self-signed cert
+on the tailnet. Every command also takes `-o`/`--output text|json` (default text),
+`--config PATH`, and `--timeout` (default 15s, per request).
 
 Exit codes: 0 ok, 1 device or API failure, 2 usage error, 3 config error. Two
 exceptions: `doctor` always exits 1 when any of its required checks fails, never 3,
@@ -51,14 +45,98 @@ file glkvm
 
 `glkvm` itself is gitignored; never commit the binary.
 
+## config
+
+`glkvm config` reads and writes the config file directly; none of its commands
+contact the device, and `--device`/`-d` is irrelevant to all of them. Each of a
+device's `url`, `user` and `password` may instead be given as `url_file`,
+`user_file` or `password_file`, naming a path glkvm reads fresh every time it
+resolves the device, with one trailing newline trimmed; a device cannot set both a
+value and its file counterpart for the same field. `user` defaults to `admin` when
+neither `user` nor `user_file` is given. Every write locks the config file
+(`config.json.lock` next to it) around its read-modify-write, so a provisioning run
+and an interactive command never race each other, and is idempotent: if nothing
+semantically changed, the file is not rewritten and the result says `"changed":
+false`. Unknown keys, at top level and inside a device, are kept as-is by every
+command except `create --replace`, which replaces the device entirely.
+
+```json
+{
+  "devices": {
+    "arwen": {
+      "url_file": "/run/secrets/arwen-url",
+      "user": "admin",
+      "password_file": "/run/secrets/arwen-password",
+      "insecure_tls": true
+    }
+  },
+  "default_device": "arwen"
+}
+```
+
+```
+glkvm config path
+```
+
+Prints the resolved config file path (`GLKVM_CONFIG`, or the `$HOME` default).
+
+```
+# --replace makes create safe to run on every activation: it replaces the whole
+# device entry (dropping unknown keys), and reports "changed": false without
+# touching the file when the result would be identical to what's already there
+glkvm config device create arwen --url-file /run/secrets/arwen-url --password-file /run/secrets/arwen-password --insecure-tls --default --replace
+```
+
+Without `--replace`, `create` refuses an existing name. `--url`/`--user` and
+`--url-file`/`--user-file` are each mutually exclusive; a password is never a plain
+flag value, only `--password-file` or `--password-stdin` (one line, trailing newline
+trimmed, empty refused).
+
+```
+glkvm config device set arwen --user root
+# --unset removes a field and its file counterpart in one step; unsetting url
+# needs a replacement (--url or --url-file) in the same command, since a device
+# with no url at all cannot be used
+glkvm config device set arwen --unset password
+glkvm config device set arwen --insecure-tls=false
+```
+
+`set` changes only the fields whose flags were actually passed; giving `--url`
+clears a previously set `url_file` and vice versa.
+
+```
+glkvm config device show arwen
+```
+
+Every field with its source (`value`, `file PATH`, `default`, or `env
+GLKVM_PASSWORD` when that overrides it); the password is shown only as
+`set`/`unset`, and a file reference is checked for whether it currently reads, never
+for what it holds.
+
+```
+glkvm config device remove arwen --if-exists
+```
+
+Removing the default device clears `default_device`. `--if-exists` makes a missing
+NAME a no-op instead of a usage error.
+
+```
+glkvm config default
+glkvm config default arwen
+```
+
+With no argument, prints the current default device. With one, sets it (the device
+must already exist).
+
 ## devices, doctor
 
 ```
 glkvm devices
 ```
 
-Lists configured device names and URLs, marking the default with `*`. Never prints
-passwords.
+Lists configured device names and URLs (or `url_file`, for a file-backed device),
+marking the default with `*`. This is an alias for `glkvm config device list`. Never
+prints passwords.
 
 ```
 glkvm doctor -d arwen -o json
@@ -68,6 +146,13 @@ Runs config, reach, auth, version, switch, capture, hid and msd checks, in that
 order, plus two informational ones (otg, mouse) that report state but never fail the
 command. All checks always run, even after an earlier one fails, so one report shows
 the full state. Exits 1 if any of the required checks failed.
+
+```
+# the config check also lists each url_file/user_file/password_file of the
+# selected device and whether it currently reads, without printing its contents;
+# an unreadable one fails the check
+glkvm doctor -d arwen
+```
 
 ## status, port
 

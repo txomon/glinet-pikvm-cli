@@ -105,3 +105,39 @@ func TestDevicesHidesPassword(t *testing.T) {
 		t.Fatalf("code %d out %s", code, out)
 	}
 }
+
+// TestDoctorFailsWhenReferencedFileUnreadable pins the config check's extra
+// duty: it enumerates the selected device's file references and fails the
+// check (without ever printing the file's contents) when one cannot be
+// read, distinct from and in addition to the resolution failure that
+// f.Device itself already reports for the same missing file.
+func TestDoctorFailsWhenReferencedFileUnreadable(t *testing.T) {
+	f := kvmdfake.New(t)
+	d := f.Device()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	cfg := map[string]any{
+		"devices": map[string]any{"t": map[string]any{
+			"url":           d.URL,
+			"user":          d.User,
+			"password_file": missing,
+			"insecure_tls":  d.InsecureTLS,
+		}},
+		"default_device": "t",
+	}
+	b, _ := json.Marshal(cfg)
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, strings.NewReader(""), &out, &errb)
+	if code != ExitDevice {
+		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
+	}
+	if !strings.Contains(out.String(), `"name": "config"`) || !strings.Contains(out.String(), `"ok": false`) {
+		t.Fatalf("config check did not fail: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "password_file") || !strings.Contains(out.String(), "unreadable") {
+		t.Fatalf("missing per-file readability detail: %s", out.String())
+	}
+}

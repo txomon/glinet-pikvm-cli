@@ -96,6 +96,24 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 	var d config.Device
 	haveDevice := false
 	if f != nil {
+		if raw, rawErr := f.Lookup(deviceName); rawErr == nil {
+			for _, ref := range []struct{ field, path string }{
+				{"url_file", raw.URLFile},
+				{"user_file", raw.UserFile},
+				{"password_file", raw.PasswordFile},
+			} {
+				if ref.path == "" {
+					continue
+				}
+				if checkErr := config.CheckFileReadable(ref.path); checkErr != nil {
+					configOK = false
+					appendDetail(fmt.Sprintf("%s %s: unreadable: %v", ref.field, ref.path, checkErr))
+				} else {
+					appendDetail(fmt.Sprintf("%s %s: readable", ref.field, ref.path))
+				}
+			}
+		}
+
 		dev, devErr := f.Device(deviceName)
 		if devErr != nil {
 			configOK = false
