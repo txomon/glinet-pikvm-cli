@@ -9,4 +9,10 @@ if [ -n "$unformatted" ]; then
   exit 1
 fi
 ./dev go vet ./...
+# same check as CI: go.mod and go.sum must already be tidy
+./dev go mod tidy
+if ! git diff --quiet -- go.mod go.sum; then
+  echo "pre-commit: go mod tidy changed go.mod/go.sum; stage the result" >&2
+  exit 1
+fi
 ./dev go test -count=1 ./...
