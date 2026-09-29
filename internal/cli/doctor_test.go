@@ -30,7 +30,7 @@ func TestDoctorBadPassword(t *testing.T) {
 func TestDoctorMissingConfigStillListsAllChecks(t *testing.T) {
 	var out, errb strings.Builder
 	p := filepath.Join(t.TempDir(), "none.json")
-	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, &out, &errb)
+	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, strings.NewReader(""), &out, &errb)
 	if code != ExitDevice {
 		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
 	}
@@ -74,7 +74,7 @@ func TestDoctorReachFailureSkipsRemainingDeviceChecks(t *testing.T) {
 	}
 
 	var out, errb strings.Builder
-	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, &out, &errb)
+	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, strings.NewReader(""), &out, &errb)
 	if code != ExitDevice {
 		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
 	}

@@ -13,6 +13,13 @@ import (
 
 func runCLI(t *testing.T, f *kvmdfake.Server, args ...string) (string, string, int) {
 	t.Helper()
+	return runCLIStdin(t, f, "", args...)
+}
+
+// runCLIStdin is runCLI with an explicit stdin body, for commands (like
+// "config device create --password-stdin") that read it.
+func runCLIStdin(t *testing.T, f *kvmdfake.Server, stdin string, args ...string) (string, string, int) {
+	t.Helper()
 	d := f.Device()
 	cfg := map[string]any{
 		"devices": map[string]any{"t": map[string]any{
@@ -29,7 +36,7 @@ func runCLI(t *testing.T, f *kvmdfake.Server, args ...string) (string, string, i
 		t.Fatal(err)
 	}
 	var out, errb strings.Builder
-	code := Execute(append([]string{"--config", p}, args...), &out, &errb)
+	code := Execute(append([]string{"--config", p}, args...), strings.NewReader(stdin), &out, &errb)
 	return out.String(), errb.String(), code
 }
 
@@ -109,7 +116,7 @@ func TestStatus(t *testing.T) {
 
 func TestMissingConfigExit3(t *testing.T) {
 	var out, errb strings.Builder
-	code := Execute([]string{"--config", filepath.Join(t.TempDir(), "none.json"), "status"}, &out, &errb)
+	code := Execute([]string{"--config", filepath.Join(t.TempDir(), "none.json"), "status"}, strings.NewReader(""), &out, &errb)
 	if code != ExitConfig {
 		t.Fatalf("code %d", code)
 	}
@@ -122,7 +129,7 @@ func TestWideConfigModeWarns(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "config.json")
 	_ = os.WriteFile(p, b, 0o644)
 	var out, errb strings.Builder
-	code := Execute([]string{"--config", p, "port"}, &out, &errb)
+	code := Execute([]string{"--config", p, "port"}, strings.NewReader(""), &out, &errb)
 	if code != 0 || !strings.Contains(errb.String(), "chmod 600") {
 		t.Fatalf("code %d stderr %s", code, errb.String())
 	}
