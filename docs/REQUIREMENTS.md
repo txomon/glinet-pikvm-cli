@@ -140,16 +140,28 @@ verb per operation, `--output=json` everywhere, `--file` for images.
 * pippin's GNOME autolock was disabled for unattended work (`idle-delay` was 300,
   `lock-enabled` was true). Restore both when done.
 
+## Settled by live runs on 2026-09-29
+
+* `set_active?port=1.N` selects host N; a bare integer is a 0-based index. Switch plus
+  capture settle takes about 3s. `set_active_next`/`prev` apply synchronously and do not
+  wrap past port 4 or port 1.
+* Port map: 1 gandalf (USB not attached), 2 unknown, 3 durin, 4 pippin. Keys and mouse go to
+  the active port. Typing at durin's getty showed nothing although its USB link is up; cause
+  not investigated, likely on durin.
+* After an EDID flash the host renegotiates for about 6s: `hdmi.signal` drops,
+  `real_resolution` reads `no_signal`, then the new mode, and `source.resolution` updates last.
+* The mouse output is `usb` (absolute), which drops relative moves. The device kvmd lacks
+  F13 to F19 and F21 to F24. Positive wheel `delta_y` scrolls up.
+* MSD images reach the host only while GL's OTG `start_cdrom` is on
+  (`POST /api/system/otg_functions?start_cdrom=true`); toggling it rebuilds the USB gadget.
+  kvmd's storage listing lags an upload or remove by about a second. Disconnecting an
+  already disconnected drive returns `MsdDisconnectedError`.
+
 ## Open questions
 
-* Whether `set_active` wants `port=1.2` or `port=1`, and how long capture takes to settle
-  after a switch. Needs one live switch.
-* Whether a port switch also moves USB and ATX to the new host. `usb_otg.links` suggests
-  USB follows the port.
 * What `/switch/gui_set_active` does differently from `set_active`.
 * ATX: `/api/atx` reports `enabled: false`, so no ATX board is attached. Power commands
   stay out of the first cut.
-* Tool name: `glkvm` is a placeholder.
 
 ## References
 
