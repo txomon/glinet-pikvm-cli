@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +46,71 @@ func TestRunStopsOnFailure(t *testing.T) {
 		if strings.Contains(p, "F14") {
 			t.Fatal("continued after failure")
 		}
+	}
+}
+
+// TestRunEnvelopeSuccess pins the success envelope shape to the same global
+// {"ok":true,"result":{...}} envelope every other command uses.
+func TestRunEnvelopeSuccess(t *testing.T) {
+	f := kvmdfake.New(t)
+	js := `[{"type":"key","keys":"f13"}]`
+	out, stderr, code := runCLI(t, f, "run", "--actions-json", js, "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	var env struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Completed int       `json:"completed"`
+			Total     int       `json:"total"`
+			Receipts  []receipt `json:"receipts"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, out)
+	}
+	if !env.OK || env.Result.Completed != 1 || env.Result.Total != 1 || len(env.Result.Receipts) != 1 {
+		t.Fatalf("out %s", out)
+	}
+	if strings.Contains(out, `"error"`) {
+		t.Fatalf("success envelope should not carry an error field: %s", out)
+	}
+}
+
+// TestRunEnvelopeFailure pins the failure envelope shape:
+// {"ok":false,"error":{"kind":"device","message":"..."},"result":{...}},
+// exit 1, with the result's receipts still present.
+func TestRunEnvelopeFailure(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailNext["/api/hid/print"] = kvmdfake.Failure{Status: 500, Kind: "HidError", Msg: "boom"}
+	js := `[{"type":"key","keys":"f13"},{"type":"type","text":"x"}]`
+	out, _, code := runCLI(t, f, "run", "--actions-json", js, "-o", "json")
+	if code != ExitDevice {
+		t.Fatalf("code %d out %s", code, out)
+	}
+	var env struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Result struct {
+			Completed int       `json:"completed"`
+			Total     int       `json:"total"`
+			Receipts  []receipt `json:"receipts"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, out)
+	}
+	if env.OK {
+		t.Fatalf("expected ok:false, out %s", out)
+	}
+	if env.Error.Kind != "device" || env.Error.Message == "" {
+		t.Fatalf("bad error envelope: %+v out %s", env.Error, out)
+	}
+	if env.Result.Completed != 1 || env.Result.Total != 2 || len(env.Result.Receipts) != 2 {
+		t.Fatalf("bad result envelope: %+v out %s", env.Result, out)
 	}
 }
 
@@ -95,12 +161,69 @@ func TestRunObserveAfter(t *testing.T) {
 	f := kvmdfake.New(t)
 	p := filepath.Join(t.TempDir(), "after.jpg")
 	js := `[{"type":"wait","ms":1}]`
-	out, stderr, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "-o", "json")
+	out, stderr, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "--observe-delay", "1ms", "-o", "json")
 	if code != 0 || !strings.Contains(out, `"screenshot"`) {
 		t.Fatalf("code %d out %s stderr %s", code, out, stderr)
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("observe-after screenshot not written: %v", err)
+	}
+}
+
+// TestRunObserveDelayFlagSleeps checks that --observe-delay is honored: a
+// small explicit delay measurably slows the command down. Kept tiny to
+// avoid a slow test.
+func TestRunObserveDelayFlagSleeps(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := filepath.Join(t.TempDir(), "after.jpg")
+	js := `[{"type":"wait","ms":1}]`
+	start := time.Now()
+	_, stderr, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "--observe-delay", "30ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if elapsed < 30*time.Millisecond {
+		t.Fatalf("--observe-delay 30ms did not sleep: elapsed %s", elapsed)
+	}
+}
+
+// TestRunObserveDelayZeroDisablesSleep checks that --observe-delay 0 skips
+// the wait entirely. Asserts a generous upper bound well under the 300ms
+// default, so a regression that ignores "0" would fail this quickly rather
+// than the test itself being slow.
+func TestRunObserveDelayZeroDisablesSleep(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := filepath.Join(t.TempDir(), "after.jpg")
+	js := `[{"type":"wait","ms":1}]`
+	start := time.Now()
+	_, stderr, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "--observe-delay", "0")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("--observe-delay 0 should disable the wait, elapsed %s", elapsed)
+	}
+}
+
+// TestRunObserveAfterSkippedOnFailure checks requirement: when an action
+// fails, the batch stops before --observe-after ever takes its screenshot,
+// so no snapshot call reaches the device after the failure.
+func TestRunObserveAfterSkippedOnFailure(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailNext["/api/hid/print"] = kvmdfake.Failure{Status: 500, Kind: "HidError", Msg: "boom"}
+	p := filepath.Join(t.TempDir(), "after.jpg")
+	js := `[{"type":"type","text":"x"}]`
+	_, _, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "--observe-delay", "0", "-o", "json")
+	if code != ExitDevice {
+		t.Fatalf("code %d", code)
+	}
+	if len(paths(f, "/api/streamer/snapshot")) != 0 {
+		t.Fatal("--observe-after took a screenshot despite the batch failing")
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Fatal("--observe-after wrote a file despite the batch failing")
 	}
 }
 

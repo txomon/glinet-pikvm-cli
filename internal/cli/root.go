@@ -40,6 +40,23 @@ func (g *globals) client(stderr io.Writer) (*kvmd.Client, config.Device, error) 
 	return kvmd.New(d, g.timeout), d, nil
 }
 
+// sleepCtx sleeps for d, or returns ctx.Err() early if ctx finishes first.
+// d <= 0 returns immediately without sleeping, so a caller's delay flag can
+// be set to 0 to disable the wait entirely.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // waitFor polls cond every interval until it reports true, returns an error,
 // or ctx is done. cond is checked immediately before the first wait.
 func waitFor(ctx context.Context, interval time.Duration, cond func() (bool, error)) error {

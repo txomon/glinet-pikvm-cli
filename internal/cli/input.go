@@ -30,6 +30,13 @@ const (
 	mouseDeltaMax = 127
 )
 
+// defaultObserveDelay is how long finishAction (and the "run" batch runner's
+// --observe-after) waits after the last action before its post-action
+// screenshot. The streamer's capture lags the actual device state by about
+// one frame, so a screenshot taken immediately after e.g. a keypress can
+// still show the pre-action screen. --observe-delay 0 disables the wait.
+const defaultObserveDelay = 300 * time.Millisecond
+
 // actionResult is the result of a key, type or mouse command: how many HID
 // actions it sent, and the screenshot taken afterward with --file, if any.
 type actionResult struct {
@@ -49,10 +56,15 @@ func atoi(name, s string) (int, error) {
 
 // finishAction optionally takes a screenshot to file, reusing doScreenshot,
 // then renders the shared {"actions":N[,"screenshot":...]} result. It is the
-// common tail of every key/type/mouse subcommand's RunE.
-func finishAction(cmd *cobra.Command, g *globals, c *kvmd.Client, actions int, file string) error {
+// common tail of every key/type/mouse subcommand's RunE. With file set, it
+// first waits delay (see defaultObserveDelay) for the capture to catch up to
+// the action just sent.
+func finishAction(cmd *cobra.Command, g *globals, c *kvmd.Client, actions int, file string, delay time.Duration) error {
 	result := actionResult{Actions: actions}
 	if file != "" {
+		if err := sleepCtx(cmd.Context(), delay); err != nil {
+			return err
+		}
 		shot, data, err := doScreenshot(cmd.Context(), c, file, false, 0)
 		if err != nil {
 			return err
@@ -140,6 +152,7 @@ func releaseKeys(ctx context.Context, c *kvmd.Client, ks []string) error {
 func newKeyCmd(g *globals) *cobra.Command {
 	var hold time.Duration
 	var file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "key <combo>...",
 		Short:         "Send one or more key combos (e.g. ctrl+alt+del)",
@@ -154,6 +167,7 @@ func newKeyCmd(g *globals) *cobra.Command {
 	}
 	cmd.Flags().DurationVar(&hold, "hold", 0, "press and hold each combo's keys for this duration before releasing")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		c, _, err := g.client(cmd.ErrOrStderr())
 		if err != nil {
@@ -162,7 +176,7 @@ func newKeyCmd(g *globals) *cobra.Command {
 		if err := doKey(cmd.Context(), c, args, hold); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, len(args), file)
+		return finishAction(cmd, g, c, len(args), file, observeDelay)
 	}
 	return cmd
 }
@@ -181,6 +195,7 @@ func newTypeCmd(g *globals) *cobra.Command {
 	var slow bool
 	var keymap string
 	var file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "type <text>",
 		Short:         "Type text as raw key events",
@@ -191,6 +206,7 @@ func newTypeCmd(g *globals) *cobra.Command {
 	cmd.Flags().BoolVar(&slow, "slow", false, "type slowly")
 	cmd.Flags().StringVar(&keymap, "keymap", "en-us", "keymap to type with")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.Args = func(cmd *cobra.Command, args []string) error {
 		if stdin {
 			if len(args) != 0 {
@@ -222,7 +238,7 @@ func newTypeCmd(g *globals) *cobra.Command {
 		if err := doType(cmd.Context(), c, text, slow, keymap); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
@@ -455,6 +471,7 @@ func exactArgs(name string, want int, names ...string) func(*cobra.Command, []st
 
 func newMouseMoveCmd(g *globals) *cobra.Command {
 	var size, file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "move X Y",
 		Short:         "Move the mouse to a screenshot pixel coordinate",
@@ -464,6 +481,7 @@ func newMouseMoveCmd(g *globals) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&size, "size", "", "override the capture size as WxH instead of querying the device")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		x, err := atoi("X", args[0])
 		if err != nil {
@@ -484,13 +502,14 @@ func newMouseMoveCmd(g *globals) *cobra.Command {
 		if err := doMouseMove(cmd.Context(), c, x, y, w, h); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
 
 func newMouseClickCmd(g *globals) *cobra.Command {
 	var size, file, button string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "click X Y",
 		Short:         "Move the mouse to a screenshot pixel coordinate and click",
@@ -501,6 +520,7 @@ func newMouseClickCmd(g *globals) *cobra.Command {
 	cmd.Flags().StringVar(&size, "size", "", "override the capture size as WxH instead of querying the device")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
 	cmd.Flags().StringVar(&button, "button", "left", "mouse button: left, right or middle")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		x, err := atoi("X", args[0])
 		if err != nil {
@@ -521,13 +541,14 @@ func newMouseClickCmd(g *globals) *cobra.Command {
 		if err := doMouseClick(cmd.Context(), c, x, y, w, h, button); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
 
 func newMouseDoubleClickCmd(g *globals) *cobra.Command {
 	var size, file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "double-click X Y",
 		Short:         "Move the mouse to a screenshot pixel coordinate and double-click",
@@ -537,6 +558,7 @@ func newMouseDoubleClickCmd(g *globals) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&size, "size", "", "override the capture size as WxH instead of querying the device")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		x, err := atoi("X", args[0])
 		if err != nil {
@@ -557,7 +579,7 @@ func newMouseDoubleClickCmd(g *globals) *cobra.Command {
 		if err := doMouseDoubleClick(cmd.Context(), c, x, y, w, h); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
@@ -565,6 +587,7 @@ func newMouseDoubleClickCmd(g *globals) *cobra.Command {
 func newMouseDragCmd(g *globals) *cobra.Command {
 	var size, file string
 	var steps int
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "drag X1 Y1 X2 Y2",
 		Short:         "Press the left button at (X1,Y1), drag to (X2,Y2), and release",
@@ -575,6 +598,7 @@ func newMouseDragCmd(g *globals) *cobra.Command {
 	cmd.Flags().StringVar(&size, "size", "", "override the capture size as WxH instead of querying the device")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
 	cmd.Flags().IntVar(&steps, "steps", defaultDragSteps, "number of linear moves from start to end")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		x1, err := atoi("X1", args[0])
 		if err != nil {
@@ -603,7 +627,7 @@ func newMouseDragCmd(g *globals) *cobra.Command {
 		if err := doMouseDrag(cmd.Context(), c, x1, y1, x2, y2, w, h, steps); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
@@ -639,6 +663,7 @@ func directionDelta(direction string, n int) (dx, dy int, err error) {
 
 func newMouseScrollCmd(g *globals) *cobra.Command {
 	var file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "scroll up|down|left|right [N]",
 		Short:         "Scroll the mouse wheel in a direction",
@@ -652,6 +677,7 @@ func newMouseScrollCmd(g *globals) *cobra.Command {
 		return nil
 	}
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		n := defaultScrollAmount
 		if len(args) == 2 {
@@ -675,7 +701,7 @@ func newMouseScrollCmd(g *globals) *cobra.Command {
 		if err := doMouseScroll(cmd.Context(), c, dx, dy); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }
@@ -683,6 +709,7 @@ func newMouseScrollCmd(g *globals) *cobra.Command {
 func newMouseNudgeCmd(g *globals) *cobra.Command {
 	var dx, dy int
 	var file string
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "nudge --dx N --dy N",
 		Short:         "Move the mouse by a relative delta",
@@ -693,6 +720,7 @@ func newMouseNudgeCmd(g *globals) *cobra.Command {
 	cmd.Flags().IntVar(&dx, "dx", 0, "horizontal relative delta, -127 to 127")
 	cmd.Flags().IntVar(&dy, "dy", 0, "vertical relative delta, -127 to 127")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --file screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		c, _, err := g.client(cmd.ErrOrStderr())
 		if err != nil {
@@ -701,7 +729,7 @@ func newMouseNudgeCmd(g *globals) *cobra.Command {
 		if err := doMouseNudge(cmd.Context(), c, dx, dy); err != nil {
 			return err
 		}
-		return finishAction(cmd, g, c, 1, file)
+		return finishAction(cmd, g, c, 1, file, observeDelay)
 	}
 	return cmd
 }

@@ -52,13 +52,13 @@ func classify(err error) (string, int) {
 }
 
 // batchError carries a structured result alongside the error that stopped a
-// batch, so renderError can print that result instead of the standard
-// {"ok":false,"error":...} envelope. Used by "run" so a failed batch's
-// receipts are still printed. Its wrapped err is always a plain error, never
-// a UsageError, even when the underlying failure (like an out-of-bounds
-// coordinate) would otherwise classify as one: an error found while
-// executing an already-validated batch is a device-class failure, like any
-// other.
+// batch, so renderError can include that result in the standard error
+// envelope instead of dropping it. Used by "run" so a failed batch's
+// receipts are still printed, as {"ok":false,"error":{...},"result":{...}}.
+// Its wrapped err is always a plain error, never a UsageError, even when the
+// underlying failure (like an out-of-bounds coordinate) would otherwise
+// classify as one: an error found while executing an already-validated
+// batch is a device-class failure, like any other.
 type batchError struct {
 	result any
 	err    error
@@ -72,11 +72,15 @@ func (e *batchError) Unwrap() error { return e.err }
 func renderError(w io.Writer, format string, err error) int {
 	var be *batchError
 	if errors.As(err, &be) {
-		_, code := classify(be.err)
+		kind, code := classify(be.err)
 		if format == "json" {
 			enc := json.NewEncoder(w)
 			enc.SetIndent("", "  ")
-			_ = enc.Encode(be.result)
+			_ = enc.Encode(map[string]any{
+				"ok":     false,
+				"error":  map[string]string{"kind": kind, "message": be.err.Error()},
+				"result": be.result,
+			})
 			return code
 		}
 		fmt.Fprintf(w, "glkvm: %s\n", be.err)

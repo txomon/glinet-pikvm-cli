@@ -3,6 +3,7 @@ package cli
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmdfake"
 )
@@ -467,6 +468,61 @@ func TestMouseDragJoinsStepAndReleaseErrors(t *testing.T) {
 	buttons := paths(f, "/api/hid/events/send_mouse_button")
 	if len(moves) != 3 || len(buttons) != 2 {
 		t.Fatalf("moves=%v buttons=%v", moves, buttons)
+	}
+}
+
+// TestKeyObserveDelaySleeps checks that --observe-delay, on a command that
+// takes a post-action --file screenshot, is honored: a small explicit delay
+// measurably slows the command down. Kept tiny to avoid a slow test.
+func TestKeyObserveDelaySleeps(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := t.TempDir() + "/s.jpg"
+	start := time.Now()
+	_, e, code := runCLI(t, f, "key", "f13", "--file", p, "--observe-delay", "30ms")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d %s", code, e)
+	}
+	if elapsed < 30*time.Millisecond {
+		t.Fatalf("--observe-delay 30ms did not sleep: elapsed %s", elapsed)
+	}
+}
+
+// TestKeyObserveDelayZeroDisablesSleep checks that --observe-delay 0 skips
+// the wait, so the same --file screenshot returns quickly instead of
+// waiting out the (much larger) default.
+func TestKeyObserveDelayZeroDisablesSleep(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := t.TempDir() + "/s.jpg"
+	start := time.Now()
+	_, e, code := runCLI(t, f, "key", "f13", "--file", p, "--observe-delay", "0")
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("code %d %s", code, e)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("--observe-delay 0 should disable the wait, elapsed %s", elapsed)
+	}
+}
+
+// TestTypeObserveDelayFlagParses checks the same flag also exists on "type".
+func TestTypeObserveDelayFlagParses(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := t.TempDir() + "/s.jpg"
+	_, e, code := runCLI(t, f, "type", "hi", "--file", p, "--observe-delay", "0")
+	if code != 0 {
+		t.Fatalf("code %d %s", code, e)
+	}
+}
+
+// TestMouseMoveObserveDelayFlagParses checks the same flag also exists on
+// the mouse subcommands.
+func TestMouseMoveObserveDelayFlagParses(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := t.TempDir() + "/s.jpg"
+	_, e, code := runCLI(t, f, "mouse", "move", "10", "10", "--file", p, "--observe-delay", "0")
+	if code != 0 {
+		t.Fatalf("code %d %s", code, e)
 	}
 }
 

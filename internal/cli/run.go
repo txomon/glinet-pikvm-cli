@@ -52,13 +52,17 @@ type receipt struct {
 
 // runResult is the result of "run": how many of the batch's actions
 // completed, a receipt for each one attempted, and the screenshot taken by
-// --observe-after, if any.
+// --observe-after, if any. It renders through the same {"ok":...} envelope
+// as every other command's result (see render/renderError). failMsg is
+// unexported, so it never appears in that JSON; RunE reads it to decide
+// whether the batch failed, and uses its text to build the envelope's
+// top-level "error", via batchError.
 type runResult struct {
 	Completed  int               `json:"completed"`
 	Total      int               `json:"total"`
 	Receipts   []receipt         `json:"receipts"`
-	Error      string            `json:"error,omitempty"`
 	Screenshot *screenshotResult `json:"screenshot,omitempty"`
+	failMsg    string
 }
 
 // loadActionsInput returns the raw batch JSON from --actions-json or
@@ -270,14 +274,7 @@ func (s *batchState) execute(a rawAction) error {
 
 // waitMs sleeps for ms milliseconds, or returns early if ctx is done.
 func waitMs(ctx context.Context, ms int) error {
-	t := time.NewTimer(time.Duration(ms) * time.Millisecond)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return sleepCtx(ctx, time.Duration(ms)*time.Millisecond)
 }
 
 // executeBatch runs actions in order, stopping at the first error. Every
@@ -296,7 +293,7 @@ func executeBatch(ctx context.Context, c *kvmd.Client, actions []rawAction) runR
 		if err != nil {
 			r.Error = err.Error()
 			result.Receipts = append(result.Receipts, r)
-			result.Error = fmt.Sprintf("action %d (%s): %v", i, a.Type, err)
+			result.failMsg = fmt.Sprintf("action %d (%s): %v", i, a.Type, err)
 			return result
 		}
 		result.Receipts = append(result.Receipts, r)
@@ -305,27 +302,22 @@ func executeBatch(ctx context.Context, c *kvmd.Client, actions []rawAction) runR
 	return result
 }
 
-// renderRunResult writes a run's result. Unlike other commands it is never
-// wrapped in the {"ok":...} envelope: a failed batch renders the same shape
-// through renderError's batchError handling, so receipts round-trip
-// unchanged whether the batch succeeded or not.
-func renderRunResult(w io.Writer, format string, result runResult) error {
-	if format == "json" {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(result)
+// runResultText writes a run's result as a short text-mode summary, the
+// same "text" callback shape every other command's render() call uses.
+func runResultText(result runResult) func(io.Writer) {
+	return func(w io.Writer) {
+		fmt.Fprintf(w, "completed %d/%d actions\n", result.Completed, result.Total)
+		if result.Screenshot != nil {
+			s := result.Screenshot
+			fmt.Fprintf(w, "wrote %s (%dx%d %s, %d bytes)\n", s.File, s.Width, s.Height, s.Format, s.Bytes)
+		}
 	}
-	fmt.Fprintf(w, "completed %d/%d actions\n", result.Completed, result.Total)
-	if result.Screenshot != nil {
-		s := result.Screenshot
-		fmt.Fprintf(w, "wrote %s (%dx%d %s, %d bytes)\n", s.File, s.Width, s.Height, s.Format, s.Bytes)
-	}
-	return nil
 }
 
 func newRunCmd(g *globals) *cobra.Command {
 	var actionsJSON, actionsFile, file string
 	var observeAfter bool
+	var observeDelay time.Duration
 	cmd := &cobra.Command{
 		Use:           "run",
 		Short:         "Run a validated batch of JSON actions, with a receipt per action",
@@ -335,8 +327,9 @@ func newRunCmd(g *globals) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&actionsJSON, "actions-json", "", "action batch as a JSON array")
 	cmd.Flags().StringVar(&actionsFile, "actions-file", "", "path to a file holding the action batch as a JSON array")
-	cmd.Flags().BoolVar(&observeAfter, "observe-after", false, "take a screenshot after the last action attempted")
+	cmd.Flags().BoolVar(&observeAfter, "observe-after", false, "take a screenshot after the last action attempted, only if the batch succeeded")
 	cmd.Flags().StringVar(&file, "file", "", "screenshot output path for --observe-after")
+	cmd.Flags().DurationVar(&observeDelay, "observe-delay", defaultObserveDelay, "delay before the --observe-after screenshot, letting the capture catch up (0 to disable)")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if observeAfter && file == "" {
 			return usagef("--observe-after requires --file")
@@ -360,26 +353,30 @@ func newRunCmd(g *globals) *cobra.Command {
 
 		result := executeBatch(cmd.Context(), c, actions)
 
-		if observeAfter {
-			shot, data, shotErr := doScreenshot(cmd.Context(), c, file, false, 0)
-			if shotErr == nil {
-				if werr := os.WriteFile(file, data, 0o644); werr != nil {
-					shotErr = fmt.Errorf("write screenshot to %s: %w", file, werr)
-				}
-			}
-			if shotErr != nil {
-				if result.Error == "" {
-					result.Error = shotErr.Error()
-				}
+		// A failed action stops the batch; --observe-after only observes a
+		// batch that ran to completion, never the aftermath of a failure.
+		if observeAfter && result.failMsg == "" {
+			if err := sleepCtx(cmd.Context(), observeDelay); err != nil {
+				result.failMsg = err.Error()
 			} else {
-				result.Screenshot = &shot
+				shot, data, shotErr := doScreenshot(cmd.Context(), c, file, false, 0)
+				if shotErr == nil {
+					if werr := os.WriteFile(file, data, 0o644); werr != nil {
+						shotErr = fmt.Errorf("write screenshot to %s: %w", file, werr)
+					}
+				}
+				if shotErr != nil {
+					result.failMsg = shotErr.Error()
+				} else {
+					result.Screenshot = &shot
+				}
 			}
 		}
 
-		if result.Error != "" {
-			return &batchError{result: result, err: errors.New(result.Error)}
+		if result.failMsg != "" {
+			return &batchError{result: result, err: errors.New(result.failMsg)}
 		}
-		return renderRunResult(cmd.OutOrStdout(), g.output, result)
+		return render(cmd.OutOrStdout(), g.output, result, runResultText(result))
 	}
 	return cmd
 }
