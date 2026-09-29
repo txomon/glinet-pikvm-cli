@@ -198,6 +198,29 @@ func TestMSDDetachKeepUSB(t *testing.T) {
 	}
 }
 
+// TestMSDDetachAlreadyDisconnectedStillTurnsStartCDROMOff pins fix round 3's
+// finding 4: the device rejects set_connected=0 on an already-disconnected
+// drive with MsdDisconnectedError (verified live), so detach must read the
+// MSD state first and only call set_connected=0 when the drive is actually
+// connected. Without that check, detaching an already-disconnected drive
+// used to fail before ever reaching the start_cdrom turn-off below.
+func TestMSDDetachAlreadyDisconnectedStillTurnsStartCDROMOff(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.OTG.StartCDROM = true // as if left on by an earlier attach/detach --keep-usb
+	_, stderr, code := runCLI(t, f, "msd", "detach")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if f.OTG.StartCDROM {
+		t.Fatal("start_cdrom still on after detaching an already-disconnected drive")
+	}
+	for _, c := range f.Calls() {
+		if c.Path == "/api/msd/set_connected" {
+			t.Fatal("set_connected called on an already-disconnected drive")
+		}
+	}
+}
+
 func TestMSDAttachDetachesDifferentImageFirst(t *testing.T) {
 	f := kvmdfake.New(t)
 	p1 := writeImage(t, "one.img")
@@ -217,11 +240,71 @@ func TestMSDAttachDetachesDifferentImageFirst(t *testing.T) {
 	}
 }
 
-func TestMSDAttachBadImageIsDeviceError(t *testing.T) {
+// TestMSDAttachUnknownImageIsUsageError pins fix round 3's finding 6: attach
+// reads the MSD state first and refuses an unknown image before touching
+// anything, so it never gets as far as disconnecting a current drive or
+// toggling start_cdrom on a request that was always going to fail.
+func TestMSDAttachUnknownImageIsUsageError(t *testing.T) {
 	f := kvmdfake.New(t)
+	before := len(f.Calls())
 	_, stderr, code := runCLI(t, f, "msd", "attach", "nope.img")
-	if code != ExitDevice || !strings.Contains(stderr, "MsdUnknownImageError") {
+	if code != ExitUsage || !strings.Contains(stderr, "nope.img") {
 		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	for _, c := range f.Calls()[before:] {
+		switch c.Path {
+		case "/api/msd/set_params", "/api/msd/set_connected", "/api/system/otg_functions":
+			t.Fatalf("device modified despite an unknown image: %+v", c)
+		}
+	}
+}
+
+// TestMSDAttachIncompleteImageIsUsageError is
+// TestMSDAttachUnknownImageIsUsageError's counterpart for an image that
+// exists in storage but is not yet complete.
+func TestMSDAttachIncompleteImageIsUsageError(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.MSD.Images["partial.img"] = &kvmdfake.MSDImage{Data: []byte("x"), Complete: false}
+	before := len(f.Calls())
+	_, stderr, code := runCLI(t, f, "msd", "attach", "partial.img")
+	if code != ExitUsage || !strings.Contains(stderr, "partial.img") {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	for _, c := range f.Calls()[before:] {
+		switch c.Path {
+		case "/api/msd/set_params", "/api/msd/set_connected", "/api/system/otg_functions":
+			t.Fatalf("device modified despite an incomplete image: %+v", c)
+		}
+	}
+}
+
+// TestMSDAttachAlreadyAttachedSameParamsIsUnchanged pins fix round 3's
+// finding 6's second half: re-attaching the same image with the same
+// cdrom/rw flags touches nothing and reports changed=false.
+func TestMSDAttachAlreadyAttachedSameParamsIsUnchanged(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := writeImage(t, "a.img")
+	runCLI(t, f, "msd", "upload", p)
+	if _, e, code := runCLI(t, f, "msd", "attach", "a.img"); code != 0 {
+		t.Fatalf("attach: code %d %s", code, e)
+	}
+
+	before := len(f.Calls())
+	out, stderr, code := runCLI(t, f, "msd", "attach", "a.img", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(out, `"changed": false`) {
+		t.Fatalf("out %s", out)
+	}
+	for _, c := range f.Calls()[before:] {
+		if c.Method != "POST" {
+			continue
+		}
+		switch c.Path {
+		case "/api/msd/set_params", "/api/msd/set_connected", "/api/system/otg_functions":
+			t.Fatalf("unexpected device mutation on an unchanged re-attach: %+v", c)
+		}
 	}
 }
 
@@ -252,6 +335,105 @@ func TestMSDUploadNotEnoughFreeSpace(t *testing.T) {
 	for _, c := range f.Calls() {
 		if c.Path == "/api/msd/write" {
 			t.Fatal("upload reached the device despite insufficient free space")
+		}
+	}
+}
+
+// TestMSDUploadMissingPathIsUsageError pins fix round 3's finding 10: a
+// missing local upload path is a usage error (exit 2), not a device error.
+func TestMSDUploadMissingPathIsUsageError(t *testing.T) {
+	f := kvmdfake.New(t)
+	missing := filepath.Join(t.TempDir(), "nope.img")
+	_, stderr, code := runCLI(t, f, "msd", "upload", missing)
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+// TestMSDUploadReplaceMissingLocalPathLeavesDeviceImageIntact pins fix
+// round 3's finding 1: --replace used to remove the device's existing image
+// through removeAndConfirm before ever stat'ing the local path, so a
+// typo'd path deleted the device image and then failed. The local file must
+// be confirmed to exist first.
+func TestMSDUploadReplaceMissingLocalPathLeavesDeviceImageIntact(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := writeImage(t, "a.img")
+	if _, e, code := runCLI(t, f, "msd", "upload", p); code != 0 {
+		t.Fatalf("initial upload: code %d %s", code, e)
+	}
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist.img")
+	before := len(f.Calls())
+	_, stderr, code := runCLI(t, f, "msd", "upload", missing, "--name", "a.img", "--replace")
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	for _, c := range f.Calls()[before:] {
+		if c.Path == "/api/msd/remove" {
+			t.Fatal("device image removed despite a missing local path")
+		}
+	}
+
+	st, err := kvmd.New(f.Device(), 5*time.Second).MSD(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Images["a.img"]; !ok {
+		t.Fatal("device image gone after a failed replace")
+	}
+}
+
+// TestMSDUploadReplaceTightSpaceFitsWithOldImageFreed pins fix round 3's
+// finding 1's other half: the free-space check must add the old image's own
+// size back in when replacing, since that space is freed by the removal
+// that follows. a.img is 1 byte; newer.img is 4 bytes; with only 3 bytes
+// free, the replacement only fits once the 1 freed byte is counted.
+func TestMSDUploadReplaceTightSpaceFitsWithOldImageFreed(t *testing.T) {
+	f := kvmdfake.New(t)
+	p1 := writeImage(t, "a.img") // 1 byte, "x"
+	if _, e, code := runCLI(t, f, "msd", "upload", p1); code != 0 {
+		t.Fatalf("initial upload: code %d %s", code, e)
+	}
+
+	p2 := filepath.Join(t.TempDir(), "newer.img")
+	if err := os.WriteFile(p2, []byte("yyyy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.MSD.Free = 3 // 3 + a.img's 1 byte == 4, exactly newer.img's size
+
+	out, stderr, code := runCLI(t, f, "msd", "upload", p2, "--name", "a.img", "--replace", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(out, `"replaced": true`) || !strings.Contains(out, `"size": 4`) {
+		t.Fatalf("out %s", out)
+	}
+}
+
+// TestMSDUploadReplaceStillTooTightIsRefused pins fix round 3's finding 1's
+// last half: even counting the freed old image, a replacement that still
+// does not fit is refused, and the old image is left intact (untouched).
+func TestMSDUploadReplaceStillTooTightIsRefused(t *testing.T) {
+	f := kvmdfake.New(t)
+	p1 := writeImage(t, "a.img") // 1 byte, "x"
+	if _, e, code := runCLI(t, f, "msd", "upload", p1); code != 0 {
+		t.Fatalf("initial upload: code %d %s", code, e)
+	}
+
+	p2 := filepath.Join(t.TempDir(), "newer.img")
+	if err := os.WriteFile(p2, []byte("yyyy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.MSD.Free = 2 // 2 + a.img's 1 byte == 3, still short of newer.img's 4
+
+	before := len(f.Calls())
+	_, stderr, code := runCLI(t, f, "msd", "upload", p2, "--name", "a.img", "--replace")
+	if code != ExitUsage || !strings.Contains(stderr, "not enough free space") {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	for _, c := range f.Calls()[before:] {
+		if c.Path == "/api/msd/remove" {
+			t.Fatal("device image removed despite insufficient space")
 		}
 	}
 }
@@ -457,5 +639,43 @@ func TestMSDWriteClearsPendingRemove(t *testing.T) {
 		if !ok || img.Size != int64(len(second)) {
 			t.Fatalf("poll %d: image missing or wrong size, got %+v (present=%v)", i, img, ok)
 		}
+	}
+}
+
+// TestEnsureStartCDROMWaitsForRequestedValue pins fix round 3's finding 8:
+// ensureStartCDROM's wait must check start_cdrom itself, not just
+// ready&&!applying. Two scripted GET responses report ready and not
+// applying while still holding the old (unrequested) start_cdrom value, a
+// transient the real device has been observed to produce; a correct
+// implementation keeps polling through both instead of settling as soon as
+// ready&&!applying is true. This counts GET calls to otg_functions rather
+// than reading back the final state, because the fake's POST flips the
+// live state synchronously either way: an implementation that settles
+// early still eventually reads the correct value on any later call, so
+// only the poll count exposes the bug. Expect 1 (the initial state check)
+// + 2 (both scripted stale polls, before the wait loop falls through to
+// the live, now-true state) = 3.
+func TestEnsureStartCDROMWaitsForRequestedValue(t *testing.T) {
+	f := kvmdfake.New(t)
+	c := kvmd.New(f.Device(), 5*time.Second)
+	ctx := context.Background()
+
+	f.ScriptOTGGet(
+		kvmdfake.OTGState{StartCDROM: false, Ready: true, Applying: false},
+		kvmdfake.OTGState{StartCDROM: false, Ready: true, Applying: false},
+	)
+
+	if err := ensureStartCDROM(ctx, c, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var gets int
+	for _, call := range otgCalls(f) {
+		if call.Method == "GET" {
+			gets++
+		}
+	}
+	if gets != 3 {
+		t.Fatalf("ensureStartCDROM made %d GET calls to otg_functions, want 3 (it must not settle for ready&&!applying without start_cdrom matching)", gets)
 	}
 }

@@ -125,8 +125,9 @@ func TestWideConfigModeWarns(t *testing.T) {
 
 func TestPortNextAndPrev(t *testing.T) {
 	f := kvmdfake.New(t)
+	f.ActivePort = 1 // port 2, away from both edges so next/prev actually move
 	out, _, code := runCLI(t, f, "port", "next", "-o", "json")
-	if code != 0 || !strings.Contains(out, `"active": 1`) {
+	if code != 0 || !strings.Contains(out, `"active": 3`) || !strings.Contains(out, `"changed": true`) {
 		t.Fatalf("next: code %d out %s", code, out)
 	}
 	found := false
@@ -140,7 +141,7 @@ func TestPortNextAndPrev(t *testing.T) {
 	}
 
 	out, _, code = runCLI(t, f, "port", "prev", "-o", "json")
-	if code != 0 || !strings.Contains(out, `"active": 4`) {
+	if code != 0 || !strings.Contains(out, `"active": 2`) || !strings.Contains(out, `"changed": true`) {
 		t.Fatalf("prev: code %d out %s", code, out)
 	}
 	found = false
@@ -151,6 +152,37 @@ func TestPortNextAndPrev(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no set_active_prev call")
+	}
+}
+
+// TestPortNextNoWrapAtLastPort pins the live fact that set_active_next does
+// not wrap: from the last port (the fake's default, 1.4) it is a no-op,
+// reported as such instead of waiting out the settle timeout.
+func TestPortNextNoWrapAtLastPort(t *testing.T) {
+	f := kvmdfake.New(t) // default ActivePort is 3 (port 4, the last port)
+	out, _, code := runCLI(t, f, "port", "next", "-o", "json")
+	if code != 0 || !strings.Contains(out, `"active": 4`) || !strings.Contains(out, `"changed": false`) {
+		t.Fatalf("code %d out %s", code, out)
+	}
+	out, _, code = runCLI(t, f, "port", "next")
+	if code != 0 || !strings.Contains(out, "already at the last port") {
+		t.Fatalf("text: code %d out %s", code, out)
+	}
+}
+
+// TestPortPrevNoWrapAtFirstPort is TestPortNextNoWrapAtLastPort's mirror:
+// set_active_prev does not wrap either, so from the first port it is a
+// no-op.
+func TestPortPrevNoWrapAtFirstPort(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.ActivePort = 0 // port 1, the first port
+	out, _, code := runCLI(t, f, "port", "prev", "-o", "json")
+	if code != 0 || !strings.Contains(out, `"active": 1`) || !strings.Contains(out, `"changed": false`) {
+		t.Fatalf("code %d out %s", code, out)
+	}
+	out, _, code = runCLI(t, f, "port", "prev")
+	if code != 0 || !strings.Contains(out, "already at the first port") {
+		t.Fatalf("text: code %d out %s", code, out)
 	}
 }
 

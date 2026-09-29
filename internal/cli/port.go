@@ -17,10 +17,13 @@ import (
 const defaultSettle = 10 * time.Second
 
 // portResult is the result of glkvm port, both for a plain show and after a
-// switch.
+// switch. Changed is only meaningful after next/prev: the device does not
+// wrap (verified live: next from 1.4 and prev from 1.1 are no-ops), so
+// asking to advance past either end leaves the active port unchanged.
 type portResult struct {
 	Active   int        `json:"active"`
 	ActiveID string     `json:"active_id"`
+	Changed  bool       `json:"changed"`
 	Ports    []portLink `json:"ports"`
 	Capture  struct {
 		Online     bool   `json:"online"`
@@ -95,6 +98,12 @@ func findPortLink(ports []portLink, id string) (int, bool) {
 // with no HDMI link at all it is expected and reported as no signal, not an
 // error. It is a plain function, not a cobra RunE, so other callers (like a
 // future batch runner) can use it without cobra.
+//
+// next/prev do not wrap on the real device (verified live: next from 1.4
+// and prev from 1.1 are no-ops), so the active port before the call is
+// captured first; when it comes back unchanged after the POST, that is
+// reported as such (Changed: false, exit 0) instead of waiting out the full
+// settle duration for a switch that was never going to happen.
 func doPort(ctx context.Context, c *kvmd.Client, arg string, settle time.Duration) (portResult, error) {
 	kind, n, err := parsePortArg(arg)
 	if err != nil {
@@ -102,6 +111,15 @@ func doPort(ctx context.Context, c *kvmd.Client, arg string, settle time.Duratio
 	}
 	if kind == portShow {
 		return buildPortResult(ctx, c)
+	}
+
+	var beforeID string
+	if kind == portNext || kind == portPrev {
+		sw, err := c.Switch(ctx)
+		if err != nil {
+			return portResult{}, err
+		}
+		beforeID = sw.ActiveID
 	}
 
 	targetID := fmt.Sprintf("1.%d", n)
@@ -119,12 +137,24 @@ func doPort(ctx context.Context, c *kvmd.Client, arg string, settle time.Duratio
 			return portResult{}, err
 		}
 	}
+
+	noop := false
 	if kind != portSwitch {
 		sw, err := c.Switch(ctx)
 		if err != nil {
 			return portResult{}, err
 		}
 		targetID = sw.ActiveID
+		noop = targetID == beforeID
+	}
+
+	if noop {
+		result, err := buildPortResult(ctx, c)
+		if err != nil {
+			return portResult{}, err
+		}
+		result.Changed = false
+		return result, nil
 	}
 
 	settleCtx, cancel := context.WithTimeout(ctx, settle)
@@ -149,6 +179,7 @@ func doPort(ctx context.Context, c *kvmd.Client, arg string, settle time.Duratio
 	if err != nil {
 		return portResult{}, err
 	}
+	result.Changed = true
 
 	if waitErr != nil {
 		if !errors.Is(waitErr, context.DeadlineExceeded) {
@@ -193,6 +224,14 @@ func newPortCmd(g *globals) *cobra.Command {
 		}
 		return render(cmd.OutOrStdout(), g.output, result, func(w io.Writer) {
 			fmt.Fprintf(w, "active: %d (%s)\n", result.Active, result.ActiveID)
+			if !result.Changed {
+				switch arg {
+				case "next":
+					fmt.Fprintln(w, "already at the last port")
+				case "prev":
+					fmt.Fprintln(w, "already at the first port")
+				}
+			}
 			for _, p := range result.Ports {
 				fmt.Fprintf(w, "  port %d %s: hdmi=%v usb=%v\n", p.Port, p.ID, p.HDMI, p.USB)
 			}

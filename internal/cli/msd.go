@@ -63,6 +63,14 @@ type msdUploadResult struct {
 	Replaced bool   `json:"replaced"`
 }
 
+// msdAttachResult is the result of glkvm msd attach. Changed is false when
+// the requested image was already connected with the same cdrom/rw flags,
+// in which case attach touched nothing on the device.
+type msdAttachResult struct {
+	msdResult
+	Changed bool `json:"changed"`
+}
+
 // msdRemoveResult is the result of glkvm msd remove.
 type msdRemoveResult struct {
 	Removed string `json:"removed"`
@@ -114,10 +122,13 @@ func doMSDStatus(ctx context.Context, c *kvmd.Client) (msdResult, error) {
 // ensureStartCDROM makes the device's start_cdrom OTG function match on,
 // issuing the change only when needed (so a caller already in the desired
 // state, with no stale error, triggers no POST), then polls every
-// waitPollInterval until the device is ready and not mid-apply. It errors
-// when the apply reports a non-empty apply_error, or the device does not
-// become ready within otgApplyTimeout. Toggling this rebuilds the device's
-// USB gadget, which briefly drops the host's keyboard and mouse.
+// waitPollInterval until the device reports start_cdrom equal to on, ready
+// and not mid-apply: ready-and-not-applying alone is not enough, since a
+// transient poll can report both while start_cdrom itself has not yet
+// caught up to the requested value. It errors when the apply reports a
+// non-empty apply_error, or the device does not become ready within
+// otgApplyTimeout. Toggling this rebuilds the device's USB gadget, which
+// briefly drops the host's keyboard and mouse.
 //
 // A POST is issued both when the current state does not already match on
 // and when apply_error is non-empty even though it does: otherwise, once an
@@ -149,7 +160,7 @@ func ensureStartCDROM(ctx context.Context, c *kvmd.Client, on bool) error {
 			return false, err
 		}
 		last = st
-		return st.Ready && !st.Applying, nil
+		return st.StartCDROM == on && st.Ready && !st.Applying, nil
 	})
 	if waitErr != nil {
 		return fmt.Errorf("otg start_cdrom did not become ready within %s: %w", otgApplyTimeout, waitErr)
@@ -163,68 +174,100 @@ func ensureStartCDROM(ctx context.Context, c *kvmd.Client, on bool) error {
 // doMSDAttach selects name as the drive's image (cdrom by default, flash
 // with --flash, read-write only with --flash --rw) and connects it, after
 // making sure start_cdrom is on: without it the host sees no disk at all,
-// regardless of drive.connected. It disconnects first when the drive is
-// already connected (set_params rejects a connected drive), ensures
-// start_cdrom, applies the new params, connects, then reads back the drive
-// and msd.online and errors if either does not match what was requested. It
-// is a plain function, not a cobra RunE, so other callers can use it
-// without cobra.
-func doMSDAttach(ctx context.Context, c *kvmd.Client, name string, flash, rw bool) (msdResult, error) {
+// regardless of drive.connected. It reads the MSD state first and refuses,
+// before touching anything, when name is not in storage or not yet
+// complete: attaching an unknown or incomplete image otherwise disconnects
+// whatever was already attached and toggles start_cdrom before
+// set_params's own rejection ever arrives, which is disruptive for a call
+// that was always going to fail. When name is already connected with the
+// same cdrom/rw flags requested, it reports Changed: false and does not
+// touch the drive or the USB gadget at all. Otherwise it disconnects first
+// when the drive is already connected (set_params rejects a connected
+// drive), ensures start_cdrom, applies the new params, connects, then reads
+// back the drive and msd.online and errors if either does not match what
+// was requested. It is a plain function, not a cobra RunE, so other callers
+// can use it without cobra.
+func doMSDAttach(ctx context.Context, c *kvmd.Client, name string, flash, rw bool) (msdAttachResult, error) {
 	if rw && !flash {
-		return msdResult{}, usagef("--rw requires --flash")
+		return msdAttachResult{}, usagef("--rw requires --flash")
 	}
 
 	st, err := c.MSD(ctx)
 	if err != nil {
-		return msdResult{}, err
+		return msdAttachResult{}, err
 	}
+
+	img, exists := st.Images[name]
+	if !exists || !img.Complete {
+		return msdAttachResult{}, usagef("image %q is not a complete image in the device's storage", name)
+	}
+
+	cdrom := !flash
+	if st.Drive.Connected && st.Drive.Image == name && st.Drive.CDROM == cdrom && st.Drive.RW == rw {
+		result, err := buildMSDResult(ctx, c)
+		if err != nil {
+			return msdAttachResult{}, err
+		}
+		return msdAttachResult{msdResult: result, Changed: false}, nil
+	}
+
 	if st.Drive.Connected {
 		if err := c.MSDSetConnected(ctx, false); err != nil {
-			return msdResult{}, err
+			return msdAttachResult{}, err
 		}
 	}
 
 	if err := ensureStartCDROM(ctx, c, true); err != nil {
-		return msdResult{}, err
+		return msdAttachResult{}, err
 	}
 
-	cdrom := !flash
 	if err := c.MSDSetParams(ctx, name, cdrom, rw); err != nil {
-		return msdResult{}, err
+		return msdAttachResult{}, err
 	}
 	if err := c.MSDSetConnected(ctx, true); err != nil {
-		return msdResult{}, err
+		return msdAttachResult{}, err
 	}
 
 	result, err := buildMSDResult(ctx, c)
 	if err != nil {
-		return msdResult{}, err
+		return msdAttachResult{}, err
 	}
 	if !result.Drive.Connected || result.Drive.Image != name || result.Drive.CDROM != cdrom || result.Drive.RW != rw {
-		return msdResult{}, fmt.Errorf("drive state after attach does not match: %+v", result.Drive)
+		return msdAttachResult{}, fmt.Errorf("drive state after attach does not match: %+v", result.Drive)
 	}
 	if !result.Online {
-		return msdResult{}, fmt.Errorf("msd reports online=false after attach")
+		return msdAttachResult{}, fmt.Errorf("msd reports online=false after attach")
 	}
 
-	return result, nil
+	return msdAttachResult{msdResult: result, Changed: true}, nil
 }
 
 // doMSDDetach disconnects the drive, reads back to confirm it took, then
 // turns start_cdrom off (unless keepUSB) so the host stops seeing a disk at
-// all. It is a plain function, not a cobra RunE, so other callers can use it
-// without cobra.
+// all. It reads the MSD state first and only calls set_connected=0 when the
+// drive is actually connected: the device rejects that call with
+// MsdDisconnectedError when it is already disconnected (verified live), and
+// without this check that error would also skip the start_cdrom turn-off
+// below. It is a plain function, not a cobra RunE, so other callers can use
+// it without cobra.
 func doMSDDetach(ctx context.Context, c *kvmd.Client, keepUSB bool) (msdResult, error) {
-	if err := c.MSDSetConnected(ctx, false); err != nil {
-		return msdResult{}, err
-	}
-
 	st, err := c.MSD(ctx)
 	if err != nil {
 		return msdResult{}, err
 	}
+
 	if st.Drive.Connected {
-		return msdResult{}, fmt.Errorf("drive still reports connected after detach")
+		if err := c.MSDSetConnected(ctx, false); err != nil {
+			return msdResult{}, err
+		}
+
+		st, err = c.MSD(ctx)
+		if err != nil {
+			return msdResult{}, err
+		}
+		if st.Drive.Connected {
+			return msdResult{}, fmt.Errorf("drive still reports connected after detach")
+		}
 	}
 
 	if !keepUSB {
@@ -265,20 +308,27 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // doMSDUpload uploads the file at path as name (default: path's base name)
 // into the device's image storage. It refuses a name collision unless
-// replace is set, which removes the existing image through removeAndConfirm
-// first (itself refused while that image is the connected one) and checks
-// free space before opening the file. The removal must be confirmed, not
-// just requested, before the write: live, uploading over an existing name
-// right after asking the device to remove it failed with
-// MsdImageExistsError, because kvmd's storage view still listed the old
-// image for about a second after the remove call had already succeeded.
-// report, when non-nil, is called with the cumulative
-// percent complete every 5%. After the upload completes, it polls the
-// device's storage listing every waitPollInterval until the image is listed
-// complete with the uploaded size, erroring if that never happens within
-// msdConfirmTimeout: kvmd's storage view has been observed to lag a write by
-// a few seconds. It is a plain function, not a cobra RunE, so other callers
-// can use it without cobra.
+// replace is set. The local file is stat'd, and free space checked, before
+// anything on the device is touched: with --replace, the space check counts
+// the old image's own size as space that will be freed (size <= st.Free +
+// oldImage.Size), since the old image is not removed until after that check
+// passes. Without this order, a typo'd local path used to delete the
+// device's old image via removeAndConfirm before os.Stat ever ran, and a
+// replacement that only fits once the old image is gone used to be refused
+// against the device's pre-removal free space. Only once the file is
+// confirmed to exist and fit is the old image (when replacing) removed
+// through removeAndConfirm (itself refused while that image is the
+// connected one). The removal must be confirmed, not just requested, before
+// the write: live, uploading over an existing name right after asking the
+// device to remove it failed with MsdImageExistsError, because kvmd's
+// storage view still listed the old image for about a second after the
+// remove call had already succeeded. report, when non-nil, is called with
+// the cumulative percent complete every 5%. After the upload completes, it
+// polls the device's storage listing every waitPollInterval until the image
+// is listed complete with the uploaded size, erroring if that never happens
+// within msdConfirmTimeout: kvmd's storage view has been observed to lag a
+// write by a few seconds. It is a plain function, not a cobra RunE, so
+// other callers can use it without cobra.
 func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace bool, report progressReport) (msdUploadResult, error) {
 	if name == "" {
 		name = filepath.Base(path)
@@ -289,27 +339,42 @@ func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace
 		return msdUploadResult{}, err
 	}
 
-	replaced := false
-	if _, exists := st.Images[name]; exists {
+	replacing := false
+	var oldImage kvmd.MSDImage
+	if img, exists := st.Images[name]; exists {
 		if !replace {
 			return msdUploadResult{}, usagef("image %q already exists, pass --replace to replace it", name)
 		}
 		if st.Drive.Connected && st.Drive.Image == name {
 			return msdUploadResult{}, usagef("cannot replace %q: it is the connected image, detach first", name)
 		}
-		if err := removeAndConfirm(ctx, c, name); err != nil {
-			return msdUploadResult{}, err
-		}
-		replaced = true
+		replacing = true
+		oldImage = img
 	}
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return msdUploadResult{}, fmt.Errorf("stat %s: %w", path, err)
+		return msdUploadResult{}, usagef("stat %s: %v", path, err)
 	}
 	size := info.Size()
-	if size > st.Free {
+
+	freeBudget := st.Free
+	if replacing {
+		freeBudget += oldImage.Size
+	}
+	if size > freeBudget {
+		if replacing {
+			return msdUploadResult{}, usagef("not enough free space: %s is %d bytes, device has %d free plus %d from the replaced image (%d total)", path, size, st.Free, oldImage.Size, freeBudget)
+		}
 		return msdUploadResult{}, usagef("not enough free space: %s is %d bytes, device has %d free", path, size, st.Free)
+	}
+
+	replaced := false
+	if replacing {
+		if err := removeAndConfirm(ctx, c, name); err != nil {
+			return msdUploadResult{}, err
+		}
+		replaced = true
 	}
 
 	f, err := os.Open(path)
@@ -500,7 +565,11 @@ func newMSDAttachCmd(g *globals) *cobra.Command {
 			return err
 		}
 		return render(cmd.OutOrStdout(), g.output, result, func(w io.Writer) {
-			fmt.Fprintf(w, "attached %s (cdrom=%v rw=%v)\n", result.Drive.Image, result.Drive.CDROM, result.Drive.RW)
+			verb := "attached"
+			if !result.Changed {
+				verb = "already attached"
+			}
+			fmt.Fprintf(w, "%s %s (cdrom=%v rw=%v)\n", verb, result.Drive.Image, result.Drive.CDROM, result.Drive.RW)
 		})
 	}
 	return cmd

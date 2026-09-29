@@ -5,6 +5,7 @@ package kvmdfake
 import (
 	"bytes"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -162,6 +163,13 @@ type Server struct {
 	// /streamer call: routeStreamer applies its first entry to the fields
 	// above and pops it, so a test can play a scripted settle sequence.
 	streamerScript []StreamerStage
+
+	// otgGetScript, when non-empty, is consumed one snapshot per GET
+	// /system/otg_functions call: routeOTGFunctionsGet reports its first
+	// entry instead of the live f.OTG state and pops it, so a test can play
+	// a transient "ready and not applying, but not yet the requested value"
+	// GET response, the way ScriptStreamer plays streamer transitions.
+	otgGetScript []OTGState
 
 	switchDoc  map[string]any
 	infoDoc    map[string]any
@@ -387,6 +395,15 @@ func (f *Server) ScriptStreamer(stages ...StreamerStage) {
 	f.streamerScript = append([]StreamerStage(nil), stages...)
 }
 
+// ScriptOTGGet queues a sequence of OTG snapshots. Each GET
+// /system/otg_functions call reports and pops the first queued snapshot;
+// once the queue is empty, the fake reports its live OTG state as usual.
+func (f *Server) ScriptOTGGet(states ...OTGState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.otgGetScript = append([]OTGState(nil), states...)
+}
+
 // newMux builds the routed handler, wrapped with the shared middleware that
 // logs calls, enforces auth, and consumes FailNext.
 func (f *Server) newMux() http.Handler {
@@ -511,13 +528,21 @@ func (f *Server) routeSetActive(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{})
 }
 
+// routeSetActiveNext advances to the next port, but does not wrap: from the
+// last port it is a no-op, matching the real device (verified live).
 func (f *Server) routeSetActiveNext(w http.ResponseWriter, r *http.Request) {
-	f.ActivePort = (f.ActivePort + 1) % len(f.VideoLinks)
+	if f.ActivePort < len(f.VideoLinks)-1 {
+		f.ActivePort++
+	}
 	ok(w, map[string]any{})
 }
 
+// routeSetActivePrev retreats to the previous port, but does not wrap: from
+// the first port it is a no-op, matching the real device (verified live).
 func (f *Server) routeSetActivePrev(w http.ResponseWriter, r *http.Request) {
-	f.ActivePort = (f.ActivePort - 1 + len(f.VideoLinks)) % len(f.VideoLinks)
+	if f.ActivePort > 0 {
+		f.ActivePort--
+	}
 	ok(w, map[string]any{})
 }
 
@@ -577,8 +602,32 @@ func (f *Server) routeFlashEDID(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "ValidatorError", fmt.Sprintf("invalid edid length %d, want 256 or 512 hex chars", len(stripped)))
 		return
 	}
-	f.EDID = strings.ToLower(stripped)
+	full := strings.ToLower(stripped)
+	if len(full) == 256 {
+		// Matches the real device: flashing a bare 128-byte EDID gets a
+		// stock CEA extension appended, so get_edid reads back 512 chars
+		// afterward even though only the base block was sent.
+		full += hex.EncodeToString(buildCEAExtension())
+	}
+	f.EDID = full
 	ok(w, map[string]any{"status": "success", "message": "EDID data has been written and applied"})
+}
+
+// buildCEAExtension returns a 128-byte stub CEA extension block: a tag,
+// revision and detailed-timing offset (pointing past this stub, so it
+// carries no timings of its own), zero padding, and a trailing checksum
+// byte that makes the block sum to zero mod 256.
+func buildCEAExtension() []byte {
+	block := make([]byte, 128)
+	block[0] = 0x02 // CEA extension tag
+	block[1] = 0x03 // revision 3
+	block[2] = 0x04 // offset to detailed timings (none present)
+	sum := 0
+	for _, b := range block[:127] {
+		sum += int(b)
+	}
+	block[127] = byte((256 - sum%256) % 256)
+	return block
 }
 
 func (f *Server) routeHID(w http.ResponseWriter, r *http.Request) {
@@ -776,6 +825,12 @@ func (f *Server) routeMSDSetConnected(w http.ResponseWriter, r *http.Request) {
 		}
 		f.MSD.Drive.Connected = true
 	} else {
+		// Matches the real device: disconnecting an already-disconnected
+		// drive is rejected, not a no-op.
+		if !f.MSD.Drive.Connected {
+			fail(w, http.StatusBadRequest, "MsdDisconnectedError", "MSD is disconnected from Server, but should be for this operation")
+			return
+		}
 		f.MSD.Drive.Connected = false
 	}
 	ok(w, map[string]any{})
@@ -802,31 +857,44 @@ func (f *Server) routeMSDRemove(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{})
 }
 
-// otgFunctionsDoc renders the fake's OTG state as the full field set GET
+// otgFunctionsDocFrom renders st as the full field set GET
 // /system/otg_functions reports. The enable_* flags are not modeled by this
 // fake (nothing here changes them); their values match the real device's
 // capture.
-func (f *Server) otgFunctionsDoc() map[string]any {
+func otgFunctionsDocFrom(st OTGState) map[string]any {
 	var applyError any
-	if f.OTG.ApplyError != "" {
-		applyError = f.OTG.ApplyError
+	if st.ApplyError != "" {
+		applyError = st.ApplyError
 	}
 	return map[string]any{
 		"apply_error":      applyError,
-		"applying":         f.OTG.Applying,
+		"applying":         st.Applying,
 		"enable_camera":    false,
 		"enable_keyboard":  true,
 		"enable_mic":       false,
 		"enable_mouse":     true,
 		"enable_mouse_alt": true,
 		"enable_mtp":       false,
-		"ready":            f.OTG.Ready,
-		"start_cdrom":      f.OTG.StartCDROM,
-		"start_flash":      f.OTG.StartFlash,
+		"ready":            st.Ready,
+		"start_cdrom":      st.StartCDROM,
+		"start_flash":      st.StartFlash,
 	}
 }
 
+// otgFunctionsDoc renders the fake's live OTG state (f.OTG).
+func (f *Server) otgFunctionsDoc() map[string]any {
+	return otgFunctionsDocFrom(f.OTG)
+}
+
+// routeOTGFunctionsGet reports and pops the next queued otgGetScript
+// snapshot, if any, instead of the live state: see ScriptOTGGet.
 func (f *Server) routeOTGFunctionsGet(w http.ResponseWriter, r *http.Request) {
+	if len(f.otgGetScript) > 0 {
+		st := f.otgGetScript[0]
+		f.otgGetScript = f.otgGetScript[1:]
+		ok(w, otgFunctionsDocFrom(st))
+		return
+	}
 	ok(w, f.otgFunctionsDoc())
 }
 
