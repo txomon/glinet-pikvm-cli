@@ -116,14 +116,15 @@ file instead of a named profile; `edid dump` writes the currently flashed hex.
 ```
 # key and type go to whatever host has focus on the currently selected port; check
 # glkvm port first if unsure which host that is
+# the device's kvmd lacks F13-F19 and F21-F24, even though glkvm accepts those
+# names syntactically
 glkvm key -d arwen ctrl+alt+del
 glkvm type -d arwen "hello"
 ```
 
 `key` takes one or more combos (`ctrl+alt+del`, `f5`); `--hold DURATION` presses and
-holds instead of tapping. The device's kvmd lacks F13-F19 and F21-F24, even though
-glkvm accepts those names syntactically. `type --stdin` reads text from stdin
-instead of an argument.
+holds instead of tapping. `type --stdin` reads text from stdin instead of an
+argument.
 
 ## mouse
 

@@ -3,9 +3,11 @@ package kvmd
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/txomon/glinet-pikvm-cli/internal/config"
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmdfake"
 )
 
@@ -34,5 +36,24 @@ func TestVersion(t *testing.T) {
 	v, err := New(kvmdfake.New(t).Device(), time.Second).Version(context.Background())
 	if err != nil || v.Model != "RM4PE" {
 		t.Fatalf("%+v %v", v, err)
+	}
+}
+
+// TestReachTransportFailure checks Reach reports an error when the request
+// never gets an HTTP response at all, as opposed to an authless 401/403
+// (covered by the doctor "reach" tests in internal/cli, against the fake).
+// A listener opened then immediately closed leaves its port refusing
+// connections, without depending on any address actually being unused.
+func TestReachTransportFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	d := config.Device{URL: "http://" + addr, User: "admin", Password: "pw"}
+	if err := New(d, time.Second).Reach(context.Background()); err == nil {
+		t.Fatal("want an error for a closed port, got nil")
 	}
 }

@@ -89,6 +89,20 @@ func addCheck(checks *[]doctorCheck, failedNames *[]string, name string, ok bool
 	}
 }
 
+// reachDetail describes a successful reach check, naming the scheme actually
+// used so an https device does not get reported as answering over plain
+// HTTP.
+func reachDetail(rawURL string) string {
+	switch {
+	case strings.HasPrefix(rawURL, "https://"):
+		return fmt.Sprintf("%s answered over HTTPS", rawURL)
+	case strings.HasPrefix(rawURL, "http://"):
+		return fmt.Sprintf("%s answered over HTTP", rawURL)
+	default:
+		return fmt.Sprintf("%s answered", rawURL)
+	}
+}
+
 // doctorErr builds the error doDoctor returns when failedNames is non-empty,
 // or nil when every required check passed.
 func doctorErr(failedNames []string) error {
@@ -153,6 +167,12 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 		for _, name := range []string{"reach", "auth", "version", "switch", "capture", "hid", "msd"} {
 			addCheck(&checks, &failedNames, name, false, "skipped: no usable device config", true)
 		}
+		// otg and mouse are informational (see below): skipped here the same
+		// way, but never required, so the report still always has all ten
+		// checks in the same order regardless of how doDoctor exits.
+		for _, name := range []string{"otg", "mouse"} {
+			addCheck(&checks, &failedNames, name, false, "skipped: no usable device config", false)
+		}
 		return checks, doctorErr(failedNames)
 	}
 
@@ -161,7 +181,7 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 	if reachErr := c.Reach(ctx); reachErr != nil {
 		addCheck(&checks, &failedNames, "reach", false, reachErr.Error(), true)
 	} else {
-		addCheck(&checks, &failedNames, "reach", true, fmt.Sprintf("%s answered over HTTP", d.URL), true)
+		addCheck(&checks, &failedNames, "reach", true, reachDetail(d.URL), true)
 	}
 
 	if _, authErr := c.Info(ctx); authErr != nil {
