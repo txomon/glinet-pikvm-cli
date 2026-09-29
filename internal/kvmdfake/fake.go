@@ -94,6 +94,10 @@ type Server struct {
 	t   testing.TB
 	ts  *httptest.Server
 	URL string
+	// insecureTLS is true for a Server built with NewTLS; Device() reports
+	// it so a client dials wss:// with certificate verification skipped,
+	// matching arwen's self-signed cert on the tailnet.
+	insecureTLS bool
 
 	// ClientUser and ClientPassword are what Device() hands out to the
 	// client under test. User and Password are what the fake actually
@@ -176,11 +180,15 @@ type Server struct {
 	versionDoc map[string]any
 	hidDoc     map[string]any
 
-	// WebtermHandshake is the columns/rows from the webterm websocket's
-	// initial client handshake, and WebtermResizes each '1' resize frame
-	// received afterward, in order. Both are set by handleWebterm.
-	WebtermHandshake WebtermSize
-	WebtermResizes   []WebtermSize
+	// webtermHandshake is the columns/rows from the webterm websocket's
+	// initial client handshake, webtermResizes each '1' resize frame
+	// received afterward in order, and webtermResizeErrs each '1' frame
+	// that failed to parse as JSON. All three are set by handleWebterm and
+	// read through their locked accessors below, never directly: a test
+	// reads them from a different goroutine than the one that writes them.
+	webtermHandshake  WebtermSize
+	webtermResizes    []WebtermSize
+	webtermResizeErrs []string
 	// WebtermEcho, true by default (matching the real device: ttyd always
 	// runs a real pty, which echoes input back as output until, and
 	// sometimes despite, "stty -echo"), makes handleWebterm write every
@@ -196,6 +204,35 @@ func (f *Server) SetWebtermEcho(on bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.WebtermEcho = on
+}
+
+// WebtermHandshakeSize returns the columns/rows from the webterm
+// websocket's initial client handshake.
+func (f *Server) WebtermHandshakeSize() WebtermSize {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.webtermHandshake
+}
+
+// WebtermResizeLog returns a copy of every '1' resize frame the webterm
+// bridge has received so far, in order.
+func (f *Server) WebtermResizeLog() []WebtermSize {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]WebtermSize, len(f.webtermResizes))
+	copy(out, f.webtermResizes)
+	return out
+}
+
+// WebtermResizeErrors returns a copy of every '1' resize frame's JSON
+// parse error message, for the malformed ones (recorded instead of being
+// silently dropped, so a test can see them).
+func (f *Server) WebtermResizeErrors() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.webtermResizeErrs))
+	copy(out, f.webtermResizeErrs)
+	return out
 }
 
 // WebtermSize is a terminal size recorded by the webterm bridge, either from
@@ -237,6 +274,30 @@ func loadArray(name string) []map[string]any {
 // New starts a fake kvmd server with default state and registers its
 // shutdown with t.Cleanup.
 func New(t testing.TB) *Server {
+	t.Helper()
+	f := newServer(t)
+	f.ts = httptest.NewServer(f.newMux())
+	f.URL = f.ts.URL
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+// NewTLS is New, but serves over TLS with a self-signed certificate, as
+// arwen's nginx does, for a test that needs to exercise wss:// and
+// InsecureTLS.
+func NewTLS(t testing.TB) *Server {
+	t.Helper()
+	f := newServer(t)
+	f.insecureTLS = true
+	f.ts = httptest.NewTLSServer(f.newMux())
+	f.URL = f.ts.URL
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+// newServer builds a Server with default state, without starting its
+// httptest server: New and NewTLS each start their own kind and set f.URL.
+func newServer(t testing.TB) *Server {
 	t.Helper()
 
 	edidGet := loadResult("upgrade_get_edid")
@@ -302,10 +363,6 @@ func New(t testing.TB) *Server {
 		WebtermEcho: true,
 	}
 	f.SnapshotJPEG = generateSnapshot(f.Width, f.Height)
-
-	f.ts = httptest.NewServer(f.newMux())
-	f.URL = f.ts.URL
-	t.Cleanup(f.ts.Close)
 	return f
 }
 
@@ -323,10 +380,11 @@ func generateSnapshot(width, height int) []byte {
 // credentials.
 func (f *Server) Device() config.Device {
 	return config.Device{
-		Name:     "fake",
-		URL:      f.URL,
-		User:     f.ClientUser,
-		Password: f.ClientPassword,
+		Name:        "fake",
+		URL:         f.URL,
+		User:        f.ClientUser,
+		Password:    f.ClientPassword,
+		InsecureTLS: f.insecureTLS,
 	}
 }
 

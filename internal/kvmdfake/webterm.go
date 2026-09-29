@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"syscall"
 
 	"github.com/coder/websocket"
 )
@@ -64,20 +65,29 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 		return
 	}
 	f.mu.Lock()
-	f.WebtermHandshake = WebtermSize{Columns: hs.Columns, Rows: hs.Rows}
+	f.webtermHandshake = WebtermSize{Columns: hs.Columns, Rows: hs.Rows}
 	echo := f.WebtermEcho
 	f.mu.Unlock()
 
-	// Title, then a motd line: this fake's stand-in for the real device's
-	// ttyd startup banner ("echo -ne ...\007"; cat /etc/motd).
+	// Title, then preferences, then a motd line: this fake's stand-in for
+	// the real device's ttyd startup banner ("echo -ne ...\007";
+	// cat /etc/motd), extended with a '2' frame so a client's frame-type
+	// skipping is exercised for preferences too, not just the title.
 	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'1'}, []byte("glkvm-fake")...)); err != nil {
 		return
 	}
-	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'0'}, []byte("fake motd\n")...)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'2'}, []byte(`{"fontSize":14}`)...)); err != nil {
+		return
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'0'}, onlcr([]byte("fake motd\n"))...)); err != nil {
 		return
 	}
 
 	cmd := exec.Command("/bin/sh")
+	// Run the child in its own process group, so teardown can kill every
+	// descendant it may have spawned (a pipeline, a background job), not
+	// just this one direct child.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return
@@ -88,10 +98,15 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 	if err := cmd.Start(); err != nil {
 		return
 	}
-	// Kill the child if the connection drops before the shell exits on its
-	// own (e.g. a client-side timeout on a still-running command), so a
-	// test never leaves an orphaned process running past its own end.
-	defer func() { _ = cmd.Process.Kill() }()
+	// Kill the child's whole process group if the connection drops before
+	// the shell exits on its own (e.g. a client-side timeout on a
+	// still-running command), so a test never leaves an orphaned process
+	// running past its own end.
+	defer func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
 
 	go func() {
 		_ = cmd.Wait()
@@ -114,14 +129,15 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 			case '0':
 				if echo {
 					// A real pty echoes input back as output, CRLF
-					// converted, before (and regardless of whether) the
-					// shell has processed it: this is what let a marker
-					// sent as one literal contiguous string leak into the
-					// output stream as if it were real command output (the
-					// bug this echo mode exists to catch in tests). Errors
-					// writing the echo are ignored: a lost echo frame does
-					// not stop the session, unlike a lost real frame below.
-					echoed := append([]byte{'0'}, bytes.ReplaceAll(data[1:], []byte("\n"), []byte("\r\n"))...)
+					// converted (onlcr, same as real output below), before
+					// (and regardless of whether) the shell has processed
+					// it: this is what let a marker sent as one literal
+					// contiguous string leak into the output stream as if
+					// it were real command output (the bug this echo mode
+					// exists to catch in tests). Errors writing the echo
+					// are ignored: a lost echo frame does not stop the
+					// session, unlike a lost real frame below.
+					echoed := append([]byte{'0'}, onlcr(data[1:])...)
 					_ = conn.Write(ctx, websocket.MessageBinary, echoed)
 				}
 				if _, err := stdin.Write(data[1:]); err != nil {
@@ -129,23 +145,28 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 				}
 			case '1':
 				var rs webtermResize
-				if err := json.Unmarshal(data[1:], &rs); err == nil {
+				if err := json.Unmarshal(data[1:], &rs); err != nil {
 					f.mu.Lock()
-					f.WebtermResizes = append(f.WebtermResizes, WebtermSize{Columns: rs.Columns, Rows: rs.Rows})
+					f.webtermResizeErrs = append(f.webtermResizeErrs, err.Error())
 					f.mu.Unlock()
+					continue
 				}
+				f.mu.Lock()
+				f.webtermResizes = append(f.webtermResizes, WebtermSize{Columns: rs.Columns, Rows: rs.Rows})
+				f.mu.Unlock()
 			}
 			// '2' (pause) and '3' (resume) are not modeled by this fake.
 		}
 	}()
 
-	// writer: child stdout+stderr -> websocket '0' output frames, until the
+	// writer: child stdout+stderr -> websocket '0' output frames, CRLF
+	// converted (onlcr) like a real pty's output processing, until the
 	// child exits (pr hits EOF) or the connection breaks.
 	buf := make([]byte, 4096)
 	for {
 		n, rerr := pr.Read(buf)
 		if n > 0 {
-			frame := append([]byte{'0'}, buf[:n]...)
+			frame := append([]byte{'0'}, onlcr(buf[:n])...)
 			if werr := conn.Write(ctx, websocket.MessageBinary, frame); werr != nil {
 				break
 			}
@@ -158,4 +179,11 @@ func (f *Server) handleWebterm(w http.ResponseWriter, r *http.Request, body []by
 	_ = stdin.Close()
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 	<-readerDone
+}
+
+// onlcr converts every \n in b to \r\n, matching a real pty's output
+// processing (the ONLCR termios flag, on by default), which applies to a
+// child's own output and not just to echoed input.
+func onlcr(b []byte) []byte {
+	return bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n"))
 }

@@ -15,7 +15,12 @@ func runCLI(t *testing.T, f *kvmdfake.Server, args ...string) (string, string, i
 	t.Helper()
 	d := f.Device()
 	cfg := map[string]any{
-		"devices":        map[string]any{"t": map[string]any{"url": d.URL, "user": d.User, "password": d.Password}},
+		"devices": map[string]any{"t": map[string]any{
+			"url":          d.URL,
+			"user":         d.User,
+			"password":     d.Password,
+			"insecure_tls": d.InsecureTLS,
+		}},
 		"default_device": "t",
 	}
 	b, _ := json.Marshal(cfg)

@@ -21,10 +21,15 @@ import (
 )
 
 // nonInteractiveCols and nonInteractiveRows are the fixed terminal size
-// requested by shell -c, which has no real terminal to query.
+// requested by shell -c, which has no real terminal to query. Wide and
+// short-ish rather than a plain 80x24: live-confirmed the remote otherwise
+// runs -c on an 80x24 pty, and a narrow terminal wraps long output lines,
+// which the marker scanner (and, more importantly, a caller reading the
+// output) sees as extra line breaks that were never in the command's own
+// output.
 const (
-	nonInteractiveCols = 80
-	nonInteractiveRows = 24
+	nonInteractiveCols = 500
+	nonInteractiveRows = 50
 )
 
 // webtermConn is the subset of *kvmd.WebtermConn the shell command needs.
@@ -38,19 +43,38 @@ type webtermConn interface {
 	Close() error
 }
 
+// errShellEscape is returned by shellRelay when the user pressed Ctrl-]
+// (ctrlCloseByte) to close the session locally, distinguishing a
+// deliberate local escape from the remote shell exiting or local input
+// closing (both of which shellRelay reports as a plain nil, not this).
+var errShellEscape = errors.New("shell: closed by Ctrl-]")
+
+// ctrlCloseByte (0x1d, Ctrl-]) is the traditional terminal escape for
+// forcing a session closed locally, without waiting for the remote end
+// (which may never respond, e.g. because the network dropped).
+const ctrlCloseByte = 0x1d
+
 // shellRelay relays bytes between a local terminal (in, out) and conn,
-// forwarding size changes received on resize, until either side reaches its
-// natural end: conn.ReadOutput returning io.EOF (the remote shell exited)
-// or in.Read returning io.EOF (local input closed). It has no dependency on
-// a real TTY, so it is testable with plain io.Reader/io.Writer values and a
-// resize channel fed by hand.
+// forwarding size changes received on resize, until one of three things
+// happens: conn.ReadOutput returns io.EOF (the remote shell exited),
+// in.Read returns io.EOF (local input closed), or the local input contains
+// ctrlCloseByte (the user pressed Ctrl-]; anything read before that byte in
+// the same chunk is still forwarded first, and shellRelay then returns
+// errShellEscape instead of nil, so the caller can tell the three cases
+// apart). warn, if non-nil, receives a short message whenever a Resize call
+// fails; a failed resize does not end the session, so it is reported
+// rather than silently dropped or treated as fatal.
 //
-// It returns as soon as either side ends, without waiting for the other: in
-// production, once the remote shell exits, the interactive command must
-// return promptly even though the goroutine blocked reading local stdin has
-// no way to be interrupted (a real terminal's stdin has no read deadline);
-// that goroutine is left to exit when the process itself does.
-func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writer, resize <-chan [2]int) error {
+// It has no dependency on a real TTY, so it is testable with plain
+// io.Reader/io.Writer values and a resize channel fed by hand.
+//
+// It returns as soon as any one of the three ends, without waiting for the
+// others: in production, once the remote shell exits, the interactive
+// command must return promptly even though the goroutine blocked reading
+// local stdin has no way to be interrupted (a real terminal's stdin has no
+// read deadline); that goroutine is left to exit when the process itself
+// does.
+func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writer, resize <-chan [2]int, warn io.Writer) error {
 	doneCh := make(chan error, 2)
 
 	go func() {
@@ -58,7 +82,18 @@ func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writ
 		for {
 			n, err := in.Read(buf)
 			if n > 0 {
-				if _, werr := conn.Write(buf[:n]); werr != nil {
+				chunk := buf[:n]
+				if idx := bytes.IndexByte(chunk, ctrlCloseByte); idx >= 0 {
+					if idx > 0 {
+						if _, werr := conn.Write(chunk[:idx]); werr != nil {
+							doneCh <- werr
+							return
+						}
+					}
+					doneCh <- errShellEscape
+					return
+				}
+				if _, werr := conn.Write(chunk); werr != nil {
 					doneCh <- werr
 					return
 				}
@@ -93,12 +128,17 @@ func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writ
 				if !ok {
 					return
 				}
-				_ = conn.Resize(sz[0], sz[1])
+				if err := conn.Resize(sz[0], sz[1]); err != nil && warn != nil {
+					fmt.Fprintf(warn, "glkvm: shell: resize to %dx%d failed: %v\n", sz[0], sz[1], err)
+				}
 			}
 		}
 	}()
 
 	err := <-doneCh
+	if errors.Is(err, errShellEscape) {
+		return errShellEscape
+	}
 	if errors.Is(err, io.EOF) {
 		return nil
 	}
@@ -176,14 +216,21 @@ func (s *markerScanner) Feed(chunk []byte) (done bool, err error) {
 			idx := bytes.Index(s.buf, []byte(s.end))
 			if idx < 0 {
 				// Flush everything except a tail long enough to still hold
-				// a split end marker (plus one byte of margin, so a CRLF
-				// pair is never split across two flushes).
-				keep := len(s.end)
-				if len(s.buf) > keep {
-					if ferr := s.flush(s.buf[:len(s.buf)-keep]); ferr != nil {
+				// a split end marker. cutAt additionally backs off one more
+				// byte when the proposed cut would land right after a bare
+				// '\r': without that, a CRLF pair split exactly at this
+				// boundary (the '\r' flushed now, the '\n' arriving in a
+				// later chunk) would leak through as a literal '\r'
+				// followed by an unconverted '\n' instead of collapsing to
+				// one '\n', which is exactly the stray-CR bug seen on a
+				// live run. Holding the '\r' back lets a later flush still
+				// collapse it once its '\n' arrives.
+				cut := cutAt(s.buf, len(s.end))
+				if cut > 0 {
+					if ferr := s.flush(s.buf[:cut]); ferr != nil {
 						return false, ferr
 					}
-					s.buf = s.buf[len(s.buf)-keep:]
+					s.buf = s.buf[cut:]
 				}
 				return false, nil
 			}
@@ -222,6 +269,17 @@ func (s *markerScanner) flush(b []byte) error {
 	return err
 }
 
+// cutAt returns how many bytes of buf are safe to flush now, keeping back
+// a margin byte tail long enough to still recognize a split end marker,
+// and never at a position right after a bare '\r' (see the call site).
+func cutAt(buf []byte, margin int) int {
+	cut := len(buf) - margin
+	if cut > 0 && buf[cut-1] == '\r' {
+		cut--
+	}
+	return cut
+}
+
 // randomToken returns a random hex string, used to build marker text that
 // will not collide with a command's own output.
 func randomToken() (string, error) {
@@ -243,10 +301,22 @@ type shellCommandResult struct {
 // contiguous string in the input glkvm itself sends.
 const markerPrefix = "__GLKVM_"
 
-// buildShellScript wraps cmd in a subshell, so an "exit" inside cmd ends
-// only that subshell (leaving $? as cmd's own status) instead of the whole
-// remote session, which would otherwise skip the trailing marker/exit
-// lines.
+// buildShellScript wraps cmd in a subshell, redirected from /dev/null, on
+// its own line between the marker printfs.
+//
+// The subshell means an "exit" inside cmd ends only that subshell (leaving
+// $? as cmd's own status) instead of the whole remote session, which would
+// otherwise skip the trailing marker/exit lines. The /dev/null redirect
+// means a command that itself reads stdin (e.g. "read x") gets immediate
+// EOF instead of consuming the marker and exit lines queued right behind
+// it on the same input stream, which live-confirmed hangs the whole run:
+// the command would read glkvm's own follow-up lines as if they were its
+// input. Putting cmd on its own line (real newlines before and after, not
+// appended to the "(" line) means a trailing "# comment" only swallows
+// cmd's own line, not the closing ")" on the line after it; a trailing
+// unescaped backslash still joins that following line, but "(" and ")" are
+// shell metacharacters recognized regardless of surrounding whitespace, so
+// the subshell still closes correctly either way.
 //
 // The remote is a real pty: the terminal echoes input back as it arrives,
 // including whatever glkvm is about to send, before "stty -echo" (kept
@@ -259,21 +329,46 @@ const markerPrefix = "__GLKVM_"
 // side, at runtime, by a printf joining two pieces that are passed as
 // separate, space-separated words. The joined marker then exists only in
 // printf's own output, never in anything glkvm wrote to the socket.
+//
+// The rest of the preamble line is also live-confirmed necessary: the
+// remote runs -c on an interactive bash, which does its own history
+// expansion ("!" in a double-quoted string fails with "event not found"
+// unless history expansion is off), pages long output through $PAGER
+// (hanging a non-interactive run waiting for a keypress that never comes),
+// and would otherwise pick up whatever HISTFILE/PROMPT_COMMAND happen to be
+// set. set +H disables history expansion; the rest heads off a pager and
+// any prompt-time side effects.
+//
+// "set +H" is bash-specific: a POSIX-only shell (dash, this repo's fake)
+// does not recognize the -H option, and since "set" is a POSIX special
+// builtin, that syntax error is fatal to a non-interactive shell, killing
+// the whole session outright rather than merely failing that one command
+// (confirmed against dash: even redirecting its stderr or following it with
+// "|| true" does not stop the shell from exiting). Guarding it behind a
+// $BASH_VERSION check means it is only ever attempted under bash, where it
+// is both valid and needed; a POSIX shell never even reaches the "set +H"
+// word, since "&&" short-circuits on the false test.
 func buildShellScript(nonce, cmd string) string {
 	var b strings.Builder
-	b.WriteString("stty -echo 2>/dev/null; PS1=; PS2=\n")
+	b.WriteString(`stty -echo 2>/dev/null; [ -n "$BASH_VERSION" ] && set +H; `)
+	b.WriteString("unset HISTFILE PROMPT_COMMAND; ")
+	b.WriteString("export PAGER=cat SYSTEMD_PAGER=cat TERM=dumb; PS1=; PS2=\n")
 	b.WriteString(`printf '%s%s\n' ` + markerPrefix + " S_" + nonce + "\n")
-	b.WriteString("( " + cmd + " )\n")
+	b.WriteString("(\n")
+	b.WriteString(cmd)
+	b.WriteString("\n) </dev/null\n")
 	b.WriteString(`printf '%s%s:%d\n' ` + markerPrefix + " E_" + nonce + ` "$?"` + "\n")
 	b.WriteString("exit\n")
 	return b.String()
 }
 
 // runShellCommand runs cmd on the remote shell over conn, writing its
-// captured output to out as it arrives, and returns the remote exit status
-// alongside that same output collected as a string (for json mode's
-// envelope). ctx bounds the whole run.
-func runShellCommand(ctx context.Context, conn webtermConn, cmd string, out io.Writer) (shellCommandResult, error) {
+// captured output to out as it arrives, and returns the remote exit
+// status. ctx bounds the whole run. captureOutput additionally accumulates
+// a copy of the output into the returned result's Output field, for json
+// mode's envelope; text mode already streamed it to out as it arrived, so
+// it passes false and does not pay for a second, otherwise-unused copy.
+func runShellCommand(ctx context.Context, conn webtermConn, cmd string, out io.Writer, captureOutput bool) (shellCommandResult, error) {
 	nonce, err := randomToken()
 	if err != nil {
 		return shellCommandResult{}, err
@@ -289,8 +384,12 @@ func runShellCommand(ctx context.Context, conn webtermConn, cmd string, out io.W
 		return shellCommandResult{}, fmt.Errorf("shell: send command: %w", err)
 	}
 
+	sink := out
 	var captured bytes.Buffer
-	scanner := newMarkerScanner(start, end, io.MultiWriter(out, &captured))
+	if captureOutput {
+		sink = io.MultiWriter(out, &captured)
+	}
+	scanner := newMarkerScanner(start, end, sink)
 	for {
 		data, err := conn.ReadOutput(ctx)
 		if err != nil {
@@ -347,11 +446,12 @@ func runShellCCommand(cmd *cobra.Command, g *globals, c *kvmd.Client, command st
 	defer conn.Close()
 
 	var out io.Writer = cmd.OutOrStdout()
-	if g.output == "json" {
+	captureOutput := g.output == "json"
+	if captureOutput {
 		out = io.Discard
 	}
 
-	result, err := runShellCommand(ctx, conn, command, out)
+	result, err := runShellCommand(ctx, conn, command, out, captureOutput)
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("shell: command did not finish within %s", g.timeout)
@@ -366,20 +466,29 @@ func runShellCCommand(cmd *cobra.Command, g *globals, c *kvmd.Client, command st
 }
 
 // runInteractiveShell opens an interactive terminal session: stdin and
-// stdout must both be real terminals (checked by the caller). It puts
-// stdin in raw mode, always restored on return, sends the initial terminal
-// size, forwards SIGWINCH as resizes, and relays until the remote shell
-// exits.
-func runInteractiveShell(cmd *cobra.Command, c *kvmd.Client) error {
+// stdout must both be real terminals (checked by the caller). The dial
+// itself is bounded by g.timeout (the session that follows is not); it
+// puts stdin in raw mode, always restored on return regardless of how the
+// function returns (a failed restore is reported to stderr instead of
+// being dropped), sends the initial terminal size, forwards SIGWINCH as
+// resizes (a failed GetSize or Resize is likewise reported, not dropped),
+// catches SIGTERM/SIGHUP/SIGQUIT to end the session and restore the
+// terminal instead of leaving it raw, and relays until the remote shell
+// exits or the user presses Ctrl-] (see shellRelay), printing a short note
+// once the terminal is back in cooked mode.
+func runInteractiveShell(cmd *cobra.Command, g *globals, c *kvmd.Client) error {
 	stdinF := cmd.InOrStdin().(*os.File)
 	stdoutF := cmd.OutOrStdout().(*os.File)
+	stderr := cmd.ErrOrStderr()
 
 	cols, rows, err := term.GetSize(int(stdoutF.Fd()))
 	if err != nil {
 		return fmt.Errorf("shell: get terminal size: %w", err)
 	}
 
-	conn, err := c.Webterm(context.Background(), cols, rows)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), g.timeout)
+	conn, err := c.Webterm(dialCtx, cols, rows)
+	dialCancel()
 	if err != nil {
 		return err
 	}
@@ -389,36 +498,74 @@ func runInteractiveShell(cmd *cobra.Command, c *kvmd.Client) error {
 	if err != nil {
 		return fmt.Errorf("shell: enter raw mode: %w", err)
 	}
-	defer func() { _ = term.Restore(int(stdinF.Fd()), oldState) }()
+	var escaped bool
+	defer func() {
+		// This must restore before reporting the escape note (a raw
+		// terminal does not reliably move to column 0 on its own), which is
+		// why both live in this one deferred closure instead of a defer
+		// each: defers run last-registered-first, so a defer registered
+		// after this one would run before it, the wrong order.
+		if rerr := term.Restore(int(stdinF.Fd()), oldState); rerr != nil {
+			fmt.Fprintf(stderr, "glkvm: shell: restore terminal: %v\n", rerr)
+		}
+		if escaped {
+			fmt.Fprintln(stderr, "glkvm: shell: closed (Ctrl-])")
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	resize := make(chan [2]int, 1)
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGWINCH)
+	signal.Notify(sig, syscall.SIGWINCH, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(sig)
 
+	// sigErrCh carries the terminating signal's error, if any, out of the
+	// goroutine below: cancel() alone would only ever surface as a bare
+	// context.Canceled from shellRelay, which does not say why.
+	sigErrCh := make(chan error, 1)
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-sig:
-				w, h, err := term.GetSize(int(stdoutF.Fd()))
-				if err != nil {
-					continue
-				}
-				select {
-				case resize <- [2]int{w, h}:
-				case <-ctx.Done():
+			case s := <-sig:
+				switch s {
+				case syscall.SIGWINCH:
+					w, h, err := term.GetSize(int(stdoutF.Fd()))
+					if err != nil {
+						fmt.Fprintf(stderr, "glkvm: shell: get terminal size after resize: %v\n", err)
+						continue
+					}
+					select {
+					case resize <- [2]int{w, h}:
+					case <-ctx.Done():
+						return
+					}
+				default:
+					// SIGTERM, SIGHUP or SIGQUIT: end the session instead of
+					// leaving the terminal stuck in raw mode, which is what
+					// happened before this handler existed.
+					sigErrCh <- fmt.Errorf("shell: closed by signal: %v", s)
+					cancel()
 					return
 				}
 			}
 		}
 	}()
 
-	return shellRelay(ctx, conn, stdinF, stdoutF, resize)
+	relayErr := shellRelay(ctx, conn, stdinF, stdoutF, resize, stderr)
+	if errors.Is(relayErr, errShellEscape) {
+		escaped = true
+		return nil
+	}
+	select {
+	case sigErr := <-sigErrCh:
+		return sigErr
+	default:
+		return relayErr
+	}
 }
 
 func newShellCmd(g *globals) *cobra.Command {
@@ -443,14 +590,17 @@ func newShellCmd(g *globals) *cobra.Command {
 			return err
 		}
 
-		if command != "" {
+		if cmd.Flags().Changed("command") {
+			if command == "" {
+				return usagef("shell -c requires a non-empty command")
+			}
 			return runShellCCommand(cmd, g, c, command)
 		}
 
 		if !isInteractiveTerminal(cmd.InOrStdin(), cmd.OutOrStdout()) {
 			return usagef("shell needs an interactive terminal on stdin and stdout; use -c 'command' to run one command instead")
 		}
-		return runInteractiveShell(cmd, c)
+		return runInteractiveShell(cmd, g, c)
 	}
 	return cmd
 }

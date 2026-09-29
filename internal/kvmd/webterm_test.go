@@ -2,10 +2,14 @@ package kvmd
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmdfake"
 )
@@ -53,14 +57,14 @@ func TestWebtermHandshakeRecorded(t *testing.T) {
 	defer cancel()
 	// The fake only sends the motd frame after recording the handshake
 	// (in that order, on its own goroutine), so seeing it here guarantees
-	// f.WebtermHandshake is already set: without this wait, the check below
+	// the handshake is already recorded: without this wait, the check below
 	// would race the fake's own goroutine, which has not necessarily
 	// processed the handshake yet just because our write to the socket
 	// returned.
 	readUntil(t, ctx, conn, "fake motd")
 
-	if f.WebtermHandshake != (kvmdfake.WebtermSize{Columns: 100, Rows: 40}) {
-		t.Fatalf("handshake = %+v", f.WebtermHandshake)
+	if got := f.WebtermHandshakeSize(); got != (kvmdfake.WebtermSize{Columns: 100, Rows: 40}) {
+		t.Fatalf("handshake = %+v", got)
 	}
 }
 
@@ -82,11 +86,17 @@ func TestWebtermEchoRoundTrip(t *testing.T) {
 	// (from the motd/title banner) must not break ReadOutput's skipping.
 	readUntil(t, ctx, conn, "fake motd")
 
-	if _, err := conn.Write([]byte("echo hello-webterm\n")); err != nil {
+	// An arithmetic expansion is evaluated only when the shell actually
+	// executes the line, never in the raw echo of the input we sent (which
+	// contains the literal, unevaluated "$((1+1))"). Waiting for "hello-2"
+	// instead of the sent text itself proves the command really ran,
+	// instead of the assertion being satisfied by nothing but the fake's
+	// own echo of the input.
+	if _, err := conn.Write([]byte("echo hello-$((1+1))\n")); err != nil {
 		t.Fatal(err)
 	}
-	out := readUntil(t, ctx, conn, "hello-webterm")
-	if !strings.Contains(out, "hello-webterm") {
+	out := readUntil(t, ctx, conn, "hello-2")
+	if !strings.Contains(out, "hello-2") {
 		t.Fatalf("out = %q", out)
 	}
 }
@@ -115,14 +125,78 @@ func TestWebtermResizeRecorded(t *testing.T) {
 	}
 	readUntil(t, ctx, conn, "after-resize")
 
+	resizes := f.WebtermResizeLog()
 	found := false
-	for _, sz := range f.WebtermResizes {
+	for _, sz := range resizes {
 		if sz == (kvmdfake.WebtermSize{Columns: 120, Rows: 50}) {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("resizes = %+v", f.WebtermResizes)
+		t.Fatalf("resizes = %+v", resizes)
+	}
+}
+
+// TestWebtermMalformedResizeRecordsError checks that a resize frame whose
+// payload does not parse as JSON is recorded as an error the test can see,
+// instead of being silently dropped. WebtermConn's Resize always marshals a
+// well-formed payload, so producing a malformed one means dialing the raw
+// websocket directly, the same way a client (or a bug in one) could send
+// any bytes it wants after a '1'.
+func TestWebtermMalformedResizeRecordsError(t *testing.T) {
+	f := kvmdfake.New(t)
+	d := f.Device()
+
+	header := http.Header{}
+	header.Set("X-KVMD-User", d.User)
+	header.Set("X-KVMD-Passwd", d.Password)
+	wsURL := "ws://" + strings.TrimPrefix(d.URL, "http://") + webtermPath
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader:   header,
+		Subprotocols: []string{"tty"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	hs, err := json.Marshal(webtermHandshake{Columns: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, hs); err != nil {
+		t.Fatal(err)
+	}
+
+	// A '1' resize frame whose body is not JSON at all.
+	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'1'}, []byte("not json")...)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Establish a happens-before against the fake's own reader goroutine,
+	// same as the other tests here: it processes frames in order, so
+	// seeing this command's output proves the malformed frame ahead of it
+	// was already handled.
+	if err := conn.Write(ctx, websocket.MessageBinary, append([]byte{'0'}, []byte("echo checkpoint\n")...)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		typ, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if typ == websocket.MessageBinary && len(data) > 0 && data[0] == '0' && strings.Contains(string(data[1:]), "checkpoint") {
+			break
+		}
+	}
+
+	errs := f.WebtermResizeErrors()
+	if len(errs) != 1 {
+		t.Fatalf("resize errors = %v, want exactly one", errs)
 	}
 }
 

@@ -222,16 +222,19 @@ glkvm run -d arwen --actions-json '[{"type":"key","keys":"f13"},{"type":"wait","
 ```
 # this is root on arwen (the KVM device), not on whatever host is selected
 # on the current port; check glkvm port first if you meant the host
+# press Ctrl-] to leave the session without waiting for the remote end
 glkvm shell -d arwen
 ```
 
 Opens an interactive terminal on the KVM over kvmd's webterm, the same one the web
 UI's "Terminal" tab uses. Needs stdin and stdout to both be real terminals; exits 0
-when the remote shell exits.
+when the remote shell exits, or when you press Ctrl-].
 
 ```
+# arwen is Buildroot, not systemd: there is no systemctl; ps, cat and df work
 # works over the tailnet even when a direct ssh session stalls
-glkvm shell -d arwen -c 'systemctl status kvmd'
+# -c exits with the remote command's own status, like ssh
+glkvm shell -d arwen -c 'df -h /userdata/media'
 ```
 
 `-c 'command'` runs one command instead, non-interactively, printing only its
