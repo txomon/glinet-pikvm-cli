@@ -614,12 +614,20 @@ const defaultScrollAmount = 3
 // directionDelta turns a scroll direction and a positive amount n into the
 // signed (dx,dy) doMouseScroll takes, as a UsageError for any direction
 // other than up, down, left or right.
+//
+// This follows the kvmd/evdev wheel convention, not screen-coordinate sign:
+// a positive REL_WHEEL (delta_y) scrolls the content up, so "up" is
+// positive and "down" is negative. Confirmed against a real device (a
+// positive delta_y arrived as scroll-up) and against upstream's own web UI
+// (reference/kvmd/web/share/js/kvm/mouse.js, __sendScroll: a browser
+// scroll-down, wheel.deltaY > 0, is sent as a negative delta_y). Horizontal
+// stays screen-oriented: "left" is negative delta_x, "right" is positive.
 func directionDelta(direction string, n int) (dx, dy int, err error) {
 	switch direction {
 	case "up":
-		return 0, -n, nil
-	case "down":
 		return 0, n, nil
+	case "down":
+		return 0, -n, nil
 	case "left":
 		return -n, 0, nil
 	case "right":

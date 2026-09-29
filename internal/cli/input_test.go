@@ -231,12 +231,17 @@ func TestMouseDragPressFailure(t *testing.T) {
 }
 
 func TestMouseScrollDirections(t *testing.T) {
+	// kvmd/evdev convention, not screen-coordinate sign: positive delta_y
+	// (REL_WHEEL) scrolls up, negative scrolls down. Pinned against a real
+	// device and upstream's own web UI (__sendScroll in
+	// reference/kvmd/web/share/js/kvm/mouse.js). Horizontal stays
+	// screen-oriented: left is negative delta_x, right is positive.
 	cases := []struct {
 		direction  string
 		wantDeltas []string
 	}{
-		{"up", []string{"delta_x=0", "delta_y=-3"}},
-		{"down", []string{"delta_x=0", "delta_y=3"}},
+		{"up", []string{"delta_x=0", "delta_y=3"}},
+		{"down", []string{"delta_x=0", "delta_y=-3"}},
 		{"left", []string{"delta_x=-3", "delta_y=0"}},
 		{"right", []string{"delta_x=3", "delta_y=0"}},
 	}
@@ -258,7 +263,7 @@ func TestMouseScrollCustomAmount(t *testing.T) {
 		t.Fatalf("code %d %s", code, e)
 	}
 	got := paths(f, "/api/hid/events/send_mouse_wheel")
-	if len(got) != 1 || !strings.Contains(got[0], "delta_y=-10") {
+	if len(got) != 1 || !strings.Contains(got[0], "delta_y=10") {
 		t.Fatalf("%v", got)
 	}
 }
