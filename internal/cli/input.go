@@ -58,19 +58,27 @@ func atoi(name, s string) (int, error) {
 // then renders the shared {"actions":N[,"screenshot":...]} result. It is the
 // common tail of every key/type/mouse subcommand's RunE. With file set, it
 // first waits delay (see defaultObserveDelay) for the capture to catch up to
-// the action just sent.
+// the action just sent. The action itself has already succeeded by the time
+// finishAction is called, so any failure here (the delay's context, the
+// screenshot, or writing it) is reported as the action having completed but
+// the screenshot having failed, instead of a bare error that reads like
+// nothing happened and invites a rerun that repeats the action (e.g. types
+// the text twice).
 func finishAction(cmd *cobra.Command, g *globals, c *kvmd.Client, actions int, file string, delay time.Duration) error {
 	result := actionResult{Actions: actions}
 	if file != "" {
+		screenshotFailed := func(err error) error {
+			return fmt.Errorf("action completed (%d actions), but the screenshot failed: %w", actions, err)
+		}
 		if err := sleepCtx(cmd.Context(), delay); err != nil {
-			return err
+			return screenshotFailed(err)
 		}
 		shot, data, err := doScreenshot(cmd.Context(), c, file, false, 0)
 		if err != nil {
-			return err
+			return screenshotFailed(err)
 		}
 		if err := os.WriteFile(file, data, 0o644); err != nil {
-			return fmt.Errorf("write screenshot to %s: %w", file, err)
+			return screenshotFailed(fmt.Errorf("write screenshot to %s: %w", file, err))
 		}
 		result.Screenshot = &shot
 	}

@@ -536,3 +536,30 @@ func TestKeyActionsCountsCombos(t *testing.T) {
 		t.Fatalf("out %s", out)
 	}
 }
+
+// TestKeyCompletesButScreenshotFailsSaysSo pins fix round 3's finding 7: a
+// key/type/mouse command whose action succeeded but whose post-action
+// --file screenshot failed used to exit 1 with a bare error, giving no sign
+// the action already happened and inviting a rerun that repeats it (e.g.
+// types the text twice). The error must say the action completed.
+func TestKeyCompletesButScreenshotFailsSaysSo(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.SetSource(false, "no_signal", 0, 0)
+	p := t.TempDir() + "/s.jpg"
+	_, stderr, code := runCLI(t, f, "key", "f13", "--file", p, "--observe-delay", "0")
+	if code != ExitDevice {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "action completed (1 actions), but the screenshot failed") {
+		t.Fatalf("stderr %s", stderr)
+	}
+	found := false
+	for _, c := range f.Calls() {
+		if c.Path == "/api/hid/events/send_key" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("key action was not actually sent despite the later screenshot failure")
+	}
+}

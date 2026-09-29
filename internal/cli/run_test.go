@@ -265,6 +265,52 @@ func TestRunWaitOutOfRange(t *testing.T) {
 	}
 }
 
+// TestRunUnknownActionFieldIsUsageError pins fix round 3's finding 5: an
+// unknown field in an action (e.g. a typo'd "buton" instead of "button")
+// used to be silently ignored, sending a left click instead of the
+// requested right one. It must be a usage error naming the action index
+// instead, before any action in the batch is sent.
+func TestRunUnknownActionFieldIsUsageError(t *testing.T) {
+	f := kvmdfake.New(t)
+	js := `[{"type":"click","x":1,"y":1,"buton":"right"}]`
+	_, stderr, code := runCLI(t, f, "run", "--actions-json", js)
+	if code != ExitUsage || !strings.Contains(stderr, "action 0") || !strings.Contains(stderr, "buton") {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/")) != 0 {
+		t.Fatal("sent actions despite an unknown field")
+	}
+}
+
+// TestRunMissingActionsFileIsUsageError pins fix round 3's finding 10: a
+// missing --actions-file is a usage error (exit 2), not a device error.
+func TestRunMissingActionsFileIsUsageError(t *testing.T) {
+	f := kvmdfake.New(t)
+	missing := filepath.Join(t.TempDir(), "nope.json")
+	_, stderr, code := runCLI(t, f, "run", "--actions-file", missing)
+	if code != ExitUsage {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+// TestRunObserveAfterScreenshotFailureReportsBatchCompleted pins fix round
+// 3's finding 7: when the batch itself succeeds but the --observe-after
+// screenshot fails, the error message must say so explicitly instead of
+// reading like nothing ran.
+func TestRunObserveAfterScreenshotFailureReportsBatchCompleted(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.SetSource(false, "no_signal", 0, 0)
+	p := filepath.Join(t.TempDir(), "after.jpg")
+	js := `[{"type":"key","keys":"f13"}]`
+	_, stderr, code := runCLI(t, f, "run", "--actions-json", js, "--observe-after", "--file", p, "--observe-delay", "0")
+	if code != ExitDevice {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "batch completed (1/1 actions)") || !strings.Contains(stderr, "observe-after screenshot failed") {
+		t.Fatalf("stderr %s", stderr)
+	}
+}
+
 func TestRunUnknownType(t *testing.T) {
 	f := kvmdfake.New(t)
 	js := `[{"type":"key","keys":"f13"},{"type":"bogus"}]`

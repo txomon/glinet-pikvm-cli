@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,7 +77,7 @@ func loadActionsInput(actionsJSON, actionsFile string) ([]byte, error) {
 	case actionsFile != "":
 		b, err := os.ReadFile(actionsFile)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", actionsFile, err)
+			return nil, usagef("read %s: %v", actionsFile, err)
 		}
 		return b, nil
 	default:
@@ -85,11 +86,24 @@ func loadActionsInput(actionsJSON, actionsFile string) ([]byte, error) {
 }
 
 // parseActions unmarshals raw into a batch of actions, as a UsageError on
-// malformed JSON.
+// malformed JSON or on an action carrying a field rawAction does not
+// recognize (e.g. a typo'd "buton" instead of "button", which would
+// otherwise be silently ignored and leave the button defaulting to left).
+// Each element is decoded on its own with DisallowUnknownFields, rather
+// than the whole array at once, so a rejection can name which action index
+// carries the bad field.
 func parseActions(raw []byte) ([]rawAction, error) {
-	var actions []rawAction
-	if err := json.Unmarshal(raw, &actions); err != nil {
+	var rawElems []json.RawMessage
+	if err := json.Unmarshal(raw, &rawElems); err != nil {
 		return nil, usagef("invalid action batch: %v", err)
+	}
+	actions := make([]rawAction, len(rawElems))
+	for i, elem := range rawElems {
+		dec := json.NewDecoder(bytes.NewReader(elem))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&actions[i]); err != nil {
+			return nil, usagef("action %d: %v", i, err)
+		}
 	}
 	return actions, nil
 }
@@ -356,20 +370,25 @@ func newRunCmd(g *globals) *cobra.Command {
 		// A failed action stops the batch; --observe-after only observes a
 		// batch that ran to completion, never the aftermath of a failure.
 		if observeAfter && result.failMsg == "" {
-			if err := sleepCtx(cmd.Context(), observeDelay); err != nil {
-				result.failMsg = err.Error()
-			} else {
-				shot, data, shotErr := doScreenshot(cmd.Context(), c, file, false, 0)
-				if shotErr == nil {
-					if werr := os.WriteFile(file, data, 0o644); werr != nil {
-						shotErr = fmt.Errorf("write screenshot to %s: %w", file, werr)
-					}
+			observeErr := func() error {
+				if err := sleepCtx(cmd.Context(), observeDelay); err != nil {
+					return err
 				}
-				if shotErr != nil {
-					result.failMsg = shotErr.Error()
-				} else {
-					result.Screenshot = &shot
+				shot, data, err := doScreenshot(cmd.Context(), c, file, false, 0)
+				if err != nil {
+					return err
 				}
+				if err := os.WriteFile(file, data, 0o644); err != nil {
+					return fmt.Errorf("write screenshot to %s: %w", file, err)
+				}
+				result.Screenshot = &shot
+				return nil
+			}()
+			if observeErr != nil {
+				// The receipts already show every action that ran; make the
+				// batch's own success explicit too, so a failed --observe-after
+				// screenshot does not read like the whole batch never ran.
+				result.failMsg = fmt.Sprintf("batch completed (%d/%d actions), but the observe-after screenshot failed: %v", result.Completed, result.Total, observeErr)
 			}
 		}
 
