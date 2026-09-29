@@ -96,6 +96,7 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 	var d config.Device
 	haveDevice := false
 	if f != nil {
+		fileCheckFailed := false
 		if raw, rawErr := f.Lookup(deviceName); rawErr == nil {
 			for _, ref := range []struct{ field, path string }{
 				{"url_file", raw.URLFile},
@@ -107,6 +108,7 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 				}
 				if checkErr := config.CheckFileReadable(ref.path); checkErr != nil {
 					configOK = false
+					fileCheckFailed = true
 					appendDetail(fmt.Sprintf("%s %s: unreadable: %v", ref.field, ref.path, checkErr))
 				} else {
 					appendDetail(fmt.Sprintf("%s %s: readable", ref.field, ref.path))
@@ -117,7 +119,13 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 		dev, devErr := f.Device(deviceName)
 		if devErr != nil {
 			configOK = false
-			appendDetail(devErr.Error())
+			// Skip the resolution error's own text when a file reference
+			// check above already failed for this device: f.Device's
+			// failure is the same missing/unreadable file, restated, and
+			// printing both just says the same thing twice.
+			if !fileCheckFailed {
+				appendDetail(devErr.Error())
+			}
 		} else {
 			d = dev
 			haveDevice = true

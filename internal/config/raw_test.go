@@ -2,8 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -75,6 +77,12 @@ func TestWithLockedUnchangedDoesNotRewrite(t *testing.T) {
 	}
 	if !st1.ModTime().Equal(st2.ModTime()) {
 		t.Fatalf("mtime changed: %v -> %v", st1.ModTime(), st2.ModTime())
+	}
+	// mtime alone can't catch a rewrite whose new content happens to land
+	// in the same second as the old one; same-inode is the real proof that
+	// no rename happened.
+	if !os.SameFile(st1, st2) {
+		t.Fatal("file was rewritten (different inode) despite reporting changed false")
 	}
 }
 
@@ -188,4 +196,129 @@ func rawString(s string) json.RawMessage {
 func rawBool(v bool) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// TestWithLockedFollowsSymlinkToTarget pins that WithLocked writes through a
+// symlinked config path: the symlink itself must survive (never replaced by
+// a plain file), and the write must land on its target, so a tool that
+// manages config.json as a symlink (e.g. a home-manager activation) is not
+// clobbered by glkvm's own atomic rename.
+func TestWithLockedFollowsSymlinkToTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real-config.json")
+	if err := os.WriteFile(target, []byte(`{"devices":{},"default_device":""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := WithLocked(linkPath, func(rf *RawFile) (*RawFile, error) {
+		rf.Devices["a"] = RawDevice{"url": rawString("https://a.example")}
+		return rf, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("want changed true")
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was replaced with a regular file")
+	}
+	got, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Fatalf("symlink now points to %q, want %q", got, target)
+	}
+
+	b, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"a"`) {
+		t.Fatalf("symlink target was not updated: %s", b)
+	}
+
+	lockFi, err := os.Lstat(linkPath + ".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockFi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("lock file should live at the unresolved path, not follow the symlink")
+	}
+}
+
+// TestWithLockedSymlinkToReadOnlyTargetFailsLoudly pins that a symlink
+// pointing into a read-only directory fails the write as an ErrConfig
+// (which the cli package's classify maps to exit 3), rather than silently
+// discarding the symlink and writing a plain file in its place.
+func TestWithLockedSymlinkToReadOnlyTargetFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(roDir, "real-config.json")
+	if err := os.WriteFile(target, []byte(`{"devices":{},"default_device":""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(roDir, 0o700) })
+
+	linkPath := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := WithLocked(linkPath, func(rf *RawFile) (*RawFile, error) {
+		rf.Devices["a"] = RawDevice{"url": rawString("https://a.example")}
+		return rf, nil
+	})
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("want ErrConfig, got %v", err)
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was replaced despite the failed write")
+	}
+	got, err := os.Readlink(linkPath)
+	if err != nil || got != target {
+		t.Fatalf("symlink target changed: %q, %v", got, err)
+	}
+}
+
+// TestWithLockedNoOpOnMissingFileDoesNotCreateIt pins the "remove
+// --if-exists on a config file that doesn't exist yet" fix: fn returning
+// the RawFile unchanged (LoadRaw's own empty result) must compare equal to
+// "the file doesn't exist" and skip the write, not silently create an
+// empty config file and report changed true.
+func TestWithLockedNoOpOnMissingFileDoesNotCreateIt(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	changed, err := WithLocked(p, func(rf *RawFile) (*RawFile, error) {
+		return rf, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("want changed false")
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("config file should not have been created: stat err=%v", err)
+	}
 }

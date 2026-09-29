@@ -109,8 +109,8 @@ func TestDevicesHidesPassword(t *testing.T) {
 // TestDoctorFailsWhenReferencedFileUnreadable pins the config check's extra
 // duty: it enumerates the selected device's file references and fails the
 // check (without ever printing the file's contents) when one cannot be
-// read, distinct from and in addition to the resolution failure that
-// f.Device itself already reports for the same missing file.
+// read. f.Device's own resolution failure for the same missing file is
+// suppressed, so the problem is reported exactly once, not twice.
 func TestDoctorFailsWhenReferencedFileUnreadable(t *testing.T) {
 	f := kvmdfake.New(t)
 	d := f.Device()
@@ -137,7 +137,33 @@ func TestDoctorFailsWhenReferencedFileUnreadable(t *testing.T) {
 	if !strings.Contains(out.String(), `"name": "config"`) || !strings.Contains(out.String(), `"ok": false`) {
 		t.Fatalf("config check did not fail: %s", out.String())
 	}
-	if !strings.Contains(out.String(), "password_file") || !strings.Contains(out.String(), "unreadable") {
-		t.Fatalf("missing per-file readability detail: %s", out.String())
+
+	var envelope struct {
+		Result []doctorCheck `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &envelope); err != nil {
+		t.Fatalf("bad json: %v: %s", err, out.String())
+	}
+	var configDetail string
+	found := false
+	for _, c := range envelope.Result {
+		if c.Name == "config" {
+			configDetail = c.Detail
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no config check in %s", out.String())
+	}
+	if !strings.Contains(configDetail, "password_file") || !strings.Contains(configDetail, "unreadable") {
+		t.Fatalf("missing per-file readability detail: %q", configDetail)
+	}
+	if n := strings.Count(configDetail, "unreadable"); n != 1 {
+		t.Fatalf("want exactly one \"unreadable\" mention, got %d: %q", n, configDetail)
+	}
+	// f.Device's own resolution error, if not suppressed, would restate the
+	// same problem as "device \"t\": password: read ...".
+	if strings.Contains(configDetail, `device "t": password:`) {
+		t.Fatalf("f.Device's redundant resolution error was not suppressed: %q", configDetail)
 	}
 }

@@ -23,11 +23,20 @@ type RawFile struct {
 	Extra         map[string]json.RawMessage
 }
 
+// emptyRawFile is the canonical RawFile a missing config file represents:
+// no devices, no default, no extra keys. Used both as LoadRaw's result for
+// a missing file and, in WithLocked, as what an absent file's content is
+// compared against, so a write that would produce this same empty document
+// is recognized as no real change and skipped.
+func emptyRawFile() *RawFile {
+	return &RawFile{Devices: map[string]RawDevice{}, Extra: map[string]json.RawMessage{}}
+}
+
 // LoadRaw reads path as a RawFile. A missing file is not an error: it
 // returns an empty RawFile, so a config command can create the file and
 // its directory on first use.
 func LoadRaw(path string) (*RawFile, error) {
-	rf := &RawFile{Devices: map[string]RawDevice{}, Extra: map[string]json.RawMessage{}}
+	rf := emptyRawFile()
 
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -105,7 +114,9 @@ func jsonSemanticallyEqual(a, b []byte) (bool, error) {
 }
 
 // atomicWrite writes data to path by writing a temp file in the same
-// directory, fsyncing it, chmod'ing it 0600, then renaming it over path.
+// directory, fsyncing it, chmod'ing it 0600, renaming it over path, then
+// fsyncing the directory too, so the rename itself is durable and not just
+// the file's content.
 func atomicWrite(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
@@ -138,20 +149,57 @@ func atomicWrite(path string, data []byte) error {
 		return fmt.Errorf("%w: rename %s to %s: %v", ErrConfig, tmpPath, path, err)
 	}
 	ok = true
+
+	df, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("%w: open %s to fsync the rename: %v", ErrConfig, dir, err)
+	}
+	defer df.Close()
+	if err := df.Sync(); err != nil {
+		return fmt.Errorf("%w: fsync %s: %v", ErrConfig, dir, err)
+	}
 	return nil
+}
+
+// resolveWritePath resolves path through any symlink chain, returning the
+// real file atomicWrite should rename onto. Renaming a temp file directly
+// over a symlink would replace the symlink itself with a plain file,
+// clobbering whatever manages it (a home-manager activation pointing
+// config.json at a file in the read-only nix store, for example): resolving
+// first means the rename lands on the symlink's target instead, and a
+// read-only target then fails the write loudly rather than silently eating
+// the symlink. A path that does not exist yet (the common case for a brand
+// new config) resolves to itself: there is nothing to follow.
+func resolveWritePath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	switch {
+	case err == nil:
+		return resolved, nil
+	case os.IsNotExist(err):
+		return path, nil
+	default:
+		return "", fmt.Errorf("%w: resolve %s: %v", ErrConfig, path, err)
+	}
 }
 
 // WithLocked runs fn with the config file at path locked against concurrent
 // writers (a provisioning run and an interactive user command, for
 // example): it creates path's directory (0700) if missing, takes an
-// exclusive flock on path+".lock" for the duration of the call, loads the
-// current RawFile fresh from disk, and passes it to fn. fn returns the
-// RawFile to write back (typically the same value, mutated) or an error,
-// which WithLocked propagates unchanged so the caller's own error
-// classification (usage, config, ...) still applies. The file is rewritten
-// only when fn's result is not semantically identical (same decoded JSON,
-// ignoring key order and whitespace) to what is already on disk; changed
-// reports whether a write happened.
+// exclusive flock on path+".lock" for the duration of the call (the lock
+// always lives at the unresolved path, even when path itself is a
+// symlink), loads the current RawFile fresh from disk, and passes it to
+// fn. fn returns the RawFile to write back (typically the same value,
+// mutated) or an error, which WithLocked propagates unchanged so the
+// caller's own error classification (usage, config, ...) still applies.
+//
+// The file is rewritten only when fn's result is not semantically
+// identical (same decoded JSON, ignoring key order and whitespace) to what
+// is already on disk; when path does not exist yet, it is compared against
+// the canonical empty document instead, so e.g. "remove --if-exists" on a
+// config file that was never created does not spring one into existence.
+// changed reports whether a write happened. The write itself lands on
+// path's resolved target when path is a symlink (see resolveWritePath), so
+// a rename never replaces a managed symlink with a plain file.
 func WithLocked(path string, fn func(*RawFile) (*RawFile, error)) (changed bool, err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -184,17 +232,33 @@ func WithLocked(path string, fn func(*RawFile) (*RawFile, error)) (changed bool,
 		return false, fmt.Errorf("%w: encode %s: %v", ErrConfig, path, err)
 	}
 
-	if oldBytes, statErr := os.ReadFile(path); statErr == nil {
-		eq, eqErr := jsonSemanticallyEqual(oldBytes, newBytes)
-		if eqErr != nil {
-			return false, fmt.Errorf("%w: compare %s: %v", ErrConfig, path, eqErr)
+	var compareBytes []byte
+	switch oldBytes, statErr := os.ReadFile(path); {
+	case statErr == nil:
+		compareBytes = oldBytes
+	case os.IsNotExist(statErr):
+		empty, emptyErr := emptyRawFile().marshal()
+		if emptyErr != nil {
+			return false, fmt.Errorf("%w: encode empty document for %s: %v", ErrConfig, path, emptyErr)
 		}
-		if eq {
-			return false, nil
-		}
+		compareBytes = empty
+	default:
+		return false, fmt.Errorf("%w: read %s: %v", ErrConfig, path, statErr)
 	}
 
-	if err := atomicWrite(path, newBytes); err != nil {
+	eq, eqErr := jsonSemanticallyEqual(compareBytes, newBytes)
+	if eqErr != nil {
+		return false, fmt.Errorf("%w: compare %s: %v", ErrConfig, path, eqErr)
+	}
+	if eq {
+		return false, nil
+	}
+
+	writePath, err := resolveWritePath(path)
+	if err != nil {
+		return false, err
+	}
+	if err := atomicWrite(writePath, newBytes); err != nil {
 		return false, err
 	}
 	return true, nil

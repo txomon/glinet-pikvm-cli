@@ -182,3 +182,23 @@ func TestLookupReturnsRawDeviceWithoutResolvingFiles(t *testing.T) {
 		t.Fatalf("got %+v", d)
 	}
 }
+
+// TestTrimTrailingNewline pins that a lone trailing "\r" (no following
+// "\n") is left alone: it is only stripped as part of a trailing "\r\n".
+func TestTrimTrailingNewline(t *testing.T) {
+	cases := map[string]string{
+		"value\n":   "value",
+		"value\r\n": "value",
+		"value\r":   "value\r",
+		"value":     "value",
+		"\n":        "",
+		"\r\n":      "",
+		"\r":        "\r",
+		"":          "",
+	}
+	for in, want := range cases {
+		if got := TrimTrailingNewline(in); got != want {
+			t.Errorf("TrimTrailingNewline(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

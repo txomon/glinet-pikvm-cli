@@ -2,10 +2,10 @@
 
 Binary `glkvm` drives a GL.iNet Comet X KVM (a PiKVM kvmd fork) over its HTTP API.
 Config lives at `$HOME/.config/glkvm/config.json` unless `GLKVM_CONFIG` names another
-path; it must be mode 0600, since it holds a plaintext password, and glkvm warns on
-stderr (but does not refuse to run) if it is wider. Credentials never go in the repo
-or on the command line: they live only in this file, or are overridden per invocation
-with `GLKVM_PASSWORD`.
+path; it must be mode 0600, since it holds a plaintext password (or a path to one, see
+`## config`), and glkvm warns on stderr (but does not refuse to run) if it is wider.
+Credentials never go in the repo or on the command line: they live only in this file
+or a file it references, or are overridden per invocation with `GLKVM_PASSWORD`.
 
 `glkvm config device create` builds the config file for you, one device per name,
 `default_device` used when `-d`/`--device` is omitted:
@@ -55,13 +55,22 @@ contact the device, and `--device`/`-d` is irrelevant to all of them. Each of a
 device's `url`, `user` and `password` may instead be given as `url_file`,
 `user_file` or `password_file`, naming a path glkvm reads fresh every time it
 resolves the device, with one trailing newline trimmed; a device cannot set both a
-value and its file counterpart for the same field. `user` defaults to `admin` when
-neither `user` nor `user_file` is given. Every write locks the config file
-(`config.json.lock` next to it) around its read-modify-write, so a provisioning run
-and an interactive command never race each other, and is idempotent: if nothing
-semantically changed, the file is not rewritten and the result says `"changed":
-false`. Unknown keys, at top level and inside a device, are kept as-is by every
-command except `create --replace`, which replaces the device entirely.
+value and its file counterpart for the same field, and an empty value (`--user ''`,
+`--url-file ''`, and so on) is refused rather than stored. `user` defaults to
+`admin` when neither `user` nor `user_file` is given. Every write locks the config
+file (`config.json.lock` next to it) around its read-modify-write, so a
+provisioning run and an interactive command never race each other; this means even
+a write that turns out to be a no-op needs a writable config directory, to create
+that lock file. Writing is idempotent: if nothing semantically changed, the file is
+not rewritten and the result says `"changed": false`. Unknown keys, at top level
+and inside a device, are kept as-is by every command except `create --replace`,
+which replaces the device entirely. If `config.json` is itself a symlink (for
+example into a home-manager/nix store path), a write goes through it and leaves
+the symlink itself in place rather than replacing it with a plain file; a
+read-only target then fails the write loudly (exit 3) instead of silently
+dropping the symlink. Do not also point a file-generating tool at the same path
+and edit it with `glkvm config`: one of them will keep undoing the other's
+writes.
 
 ```json
 {
@@ -90,10 +99,16 @@ Prints the resolved config file path (`GLKVM_CONFIG`, or the `$HOME` default).
 glkvm config device create arwen --url-file /run/secrets/arwen-url --password-file /run/secrets/arwen-password --insecure-tls --default --replace
 ```
 
-Without `--replace`, `create` refuses an existing name. `--url`/`--user` and
-`--url-file`/`--user-file` are each mutually exclusive; a password is never a plain
+Without `--replace`, `create` refuses an existing name. `--url`/`--url-file` and
+`--user`/`--user-file` are each mutually exclusive; a password is never a plain
 flag value, only `--password-file` or `--password-stdin` (one line, trailing newline
 trimmed, empty refused).
+
+```
+# feeding a file straight into stdin, rather than piping some other command's
+# output into it, keeps the password out of shell history and the process list
+glkvm config device set arwen --password-stdin < /run/secrets/arwen-password
+```
 
 ```
 glkvm config device set arwen --user root
@@ -111,10 +126,10 @@ clears a previously set `url_file` and vice versa.
 glkvm config device show arwen
 ```
 
-Every field with its source (`value`, `file PATH`, `default`, or `env
-GLKVM_PASSWORD` when that overrides it); the password is shown only as
-`set`/`unset`, and a file reference is checked for whether it currently reads, never
-for what it holds.
+Every field, including `insecure_tls`, with its source (`value`, `file PATH`,
+`default`, or `env GLKVM_PASSWORD` when that overrides the password); the password
+is shown only as `set`/`unset`, and a file reference is checked for whether it
+currently reads, never for what it holds.
 
 ```
 glkvm config device remove arwen --if-exists

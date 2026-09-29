@@ -175,10 +175,14 @@ func readFileValue(name, field, path string) (string, error) {
 }
 
 // TrimTrailingNewline strips one trailing "\n" or "\r\n" from s, if present.
+// A lone trailing "\r" with no following "\n" is left alone: it is not a
+// newline, and stripping it would silently change a value that happens to
+// end in a carriage return.
 func TrimTrailingNewline(s string) string {
-	s = strings.TrimSuffix(s, "\n")
-	s = strings.TrimSuffix(s, "\r")
-	return s
+	if strings.HasSuffix(s, "\r\n") {
+		return s[:len(s)-2]
+	}
+	return strings.TrimSuffix(s, "\n")
 }
 
 // CheckFileReadable reports whether path can currently be read in full,
