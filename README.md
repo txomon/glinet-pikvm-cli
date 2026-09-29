@@ -31,7 +31,7 @@ with the remote command's own status, like ssh (see the `shell` section).
 
 ```
 ./dev go build -o glkvm ./cmd/glkvm
-# one-time per clone: commits then refuse to land unless gofmt, vet and tests pass
+# one-time per clone: commits then refuse to land unless gofmt, vet and race tests pass
 git config core.hooksPath .githooks
 ```
 
