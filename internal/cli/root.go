@@ -133,6 +133,7 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newStatusCmd(g))
 	root.AddCommand(newPortCmd(g))
 	root.AddCommand(newScreenshotCmd(g))
+	root.AddCommand(newEdidCmd(g))
 
 	return root
 }
