@@ -24,6 +24,15 @@ func (e UsageError) Error() string { return e.Msg }
 
 func usagef(format string, a ...any) error { return UsageError{Msg: fmt.Sprintf(format, a...)} }
 
+// ExitCodeError makes glkvm exit with an arbitrary process exit code,
+// bypassing the usual usage/device/config classification below. "shell -c"
+// uses it to propagate the remote command's own exit status in text mode,
+// like ssh: Execute returns Code directly, without printing anything of its
+// own, since a nonzero remote status is not itself a glkvm-side failure.
+type ExitCodeError struct{ Code int }
+
+func (e ExitCodeError) Error() string { return fmt.Sprintf("remote command exited %d", e.Code) }
+
 // render writes result to w. In json mode it wraps result in the standard
 // {"ok":true,"result":...} envelope; otherwise it calls text, if given.
 func render(w io.Writer, format string, result any, text func(io.Writer)) error {

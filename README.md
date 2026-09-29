@@ -28,9 +28,10 @@ omitted:
 cert on the tailnet. Every command also takes `-o`/`--output text|json` (default
 text), `--config PATH`, and `--timeout` (default 15s, per request).
 
-Exit codes: 0 ok, 1 device or API failure, 2 usage error, 3 config error (`doctor` is
-the one exception: it always exits 1 when any of its required checks fails, never 3,
-even when the failure is an unreadable config).
+Exit codes: 0 ok, 1 device or API failure, 2 usage error, 3 config error. Two
+exceptions: `doctor` always exits 1 when any of its required checks fails, never 3,
+even when the failure is an unreadable config; `shell -c` in text mode instead exits
+with the remote command's own status, like ssh (see the `shell` section).
 
 ## Build
 
@@ -215,6 +216,30 @@ Action schema, one object per batch entry:
 # the capture needs time to catch up with whatever action came before it
 glkvm run -d arwen --actions-json '[{"type":"key","keys":"f13"},{"type":"wait","ms":300},{"type":"screenshot","file":"step.jpg"}]'
 ```
+
+## shell
+
+```
+# this is root on arwen (the KVM device), not on whatever host is selected
+# on the current port; check glkvm port first if you meant the host
+glkvm shell -d arwen
+```
+
+Opens an interactive terminal on the KVM over kvmd's webterm, the same one the web
+UI's "Terminal" tab uses. Needs stdin and stdout to both be real terminals; exits 0
+when the remote shell exits.
+
+```
+# works over the tailnet even when a direct ssh session stalls
+glkvm shell -d arwen -c 'systemctl status kvmd'
+```
+
+`-c 'command'` runs one command instead, non-interactively, printing only its
+output. In text mode `-c` exits with the remote command's own status, like ssh
+(`glkvm shell -c 'exit 3'` makes glkvm itself exit 3); in `-o json` mode glkvm
+always exits 0 when the session itself worked, and the remote status is
+`"exit_code"` in the result, alongside `"output"`. `--timeout` bounds the whole
+`-c` run; a command that does not finish in time is a device error.
 
 ## GLKVM_PASSWORD
 

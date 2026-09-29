@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -158,6 +159,7 @@ func newRoot(g *globals, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRunCmd(g))
 	root.AddCommand(newDevicesCmd(g))
 	root.AddCommand(newDoctorCmd(g))
+	root.AddCommand(newShellCmd(g))
 
 	return root
 }
@@ -189,6 +191,11 @@ func Execute(args []string, stdout, stderr io.Writer) int {
 	err := root.Execute()
 	if err == nil {
 		return ExitOK
+	}
+
+	var ece ExitCodeError
+	if errors.As(err, &ece) {
+		return ece.Code
 	}
 
 	w := stderr
