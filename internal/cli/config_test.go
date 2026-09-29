@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -193,6 +194,46 @@ func TestConfigDeviceCreateURLFileStoredAbsolute(t *testing.T) {
 	}
 }
 
+// TestConfigDeviceCreateSymlinkedConfigReadOnlyTargetExitsConfigError is an
+// end-to-end check, through the full command path, that a config path
+// symlinked into a read-only location fails as exit 3 (config error), not
+// by silently replacing the symlink with a plain file. internal/config's
+// own tests cover WithLocked's symlink handling in more detail; this just
+// proves the CLI wiring reaches the same behavior.
+func TestConfigDeviceCreateSymlinkedConfigReadOnlyTargetExitsConfigError(t *testing.T) {
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "ro")
+	if err := os.Mkdir(roDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(roDir, "real-config.json")
+	if err := os.WriteFile(target, []byte(`{"devices":{},"default_device":""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(roDir, 0o700) })
+
+	linkPath := filepath.Join(dir, "config.json")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runConfig(t, linkPath, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
+	if code != ExitConfig {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was replaced despite the failed write")
+	}
+}
+
 func TestConfigDeviceCreatePasswordStdin(t *testing.T) {
 	p := freshConfigPath(t)
 	out, stderr, code := runConfig(t, p, "hunter2\n", "config", "device", "create", "arwen", "--url", "https://arwen.example.net", "--password-stdin")
@@ -227,6 +268,54 @@ func TestConfigDeviceCreatePasswordFlagsAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// TestConfigDeviceCreateEmptyFlagValuesRefused pins that an explicitly
+// empty value for a flag that takes a path or a name is a usage error, not
+// a silently stored empty string: "--url-file ”" used to fall through to
+// storing url_file: "" instead of being refused.
+func TestConfigDeviceCreateEmptyFlagValuesRefused(t *testing.T) {
+	for _, args := range [][]string{
+		{"config", "device", "create", "arwen", "--url-file", ""},
+		{"config", "device", "create", "arwen", "--url", "https://arwen.example.net", "--user", ""},
+		{"config", "device", "create", "arwen", "--url", "https://arwen.example.net", "--user-file", ""},
+		{"config", "device", "create", "arwen", "--url", "https://arwen.example.net", "--password-file", ""},
+	} {
+		p := freshConfigPath(t)
+		_, stderr, code := runConfig(t, p, "", args...)
+		if code != ExitUsage {
+			t.Fatalf("%v: code %d stderr %s", args, code, stderr)
+		}
+		if _, err := os.Stat(p); err == nil {
+			t.Fatalf("%v: config file should not have been created", args)
+		}
+	}
+}
+
+// TestConfigDeviceSetEmptyFlagValuesRefused is
+// TestConfigDeviceCreateEmptyFlagValuesRefused's "set" counterpart, against
+// an already-existing device so the empty value is the only thing under
+// test.
+func TestConfigDeviceSetEmptyFlagValuesRefused(t *testing.T) {
+	for _, args := range [][]string{
+		{"config", "device", "set", "arwen", "--url-file", ""},
+		{"config", "device", "set", "arwen", "--user", ""},
+		{"config", "device", "set", "arwen", "--user-file", ""},
+		{"config", "device", "set", "arwen", "--password-file", ""},
+	} {
+		p := freshConfigPath(t)
+		runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
+		before := deviceFromConfigFile(t, p, "arwen")
+
+		_, stderr, code := runConfig(t, p, "", args...)
+		if code != ExitUsage {
+			t.Fatalf("%v: code %d stderr %s", args, code, stderr)
+		}
+		after := deviceFromConfigFile(t, p, "arwen")
+		if before["url"] != after["url"] {
+			t.Fatalf("%v: device changed despite refusal: %+v -> %+v", args, before, after)
+		}
+	}
+}
+
 // --- idempotency ---
 
 func TestConfigDeviceCreateReplaceIsIdempotent(t *testing.T) {
@@ -258,6 +347,9 @@ func TestConfigDeviceCreateReplaceIsIdempotent(t *testing.T) {
 	if !st1.ModTime().Equal(st2.ModTime()) {
 		t.Fatalf("mtime changed: %v -> %v", st1.ModTime(), st2.ModTime())
 	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("file was rewritten (different inode) despite reporting changed false")
+	}
 }
 
 func TestConfigDeviceSetIsIdempotent(t *testing.T) {
@@ -284,6 +376,9 @@ func TestConfigDeviceSetIsIdempotent(t *testing.T) {
 	}
 	if !st1.ModTime().Equal(st2.ModTime()) {
 		t.Fatalf("mtime changed: %v -> %v", st1.ModTime(), st2.ModTime())
+	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("file was rewritten (different inode) despite reporting changed false")
 	}
 }
 
@@ -441,12 +536,30 @@ func TestConfigDeviceRemoveMissingRefusedUnlessIfExists(t *testing.T) {
 	}
 }
 
+// TestConfigDeviceRemoveIfExistsMissingConfigFileIsANoOp pins that "remove
+// --if-exists" against a config file that does not exist at all leaves no
+// file behind and reports changed false, rather than springing an empty
+// config file into existence just because WithLocked ran.
+func TestConfigDeviceRemoveIfExistsMissingConfigFileIsANoOp(t *testing.T) {
+	p := freshConfigPath(t)
+	out, stderr, code := runConfig(t, p, "", "config", "device", "remove", "arwen", "--if-exists", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(out, `"changed": false`) {
+		t.Fatalf("out %s", out)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("config file should not have been created: stat err=%v", err)
+	}
+}
+
 // --- device list / devices alias ---
 
 func TestConfigDeviceListMatchesDevicesAlias(t *testing.T) {
 	p := freshConfigPath(t)
 	runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net", "--default")
-	runConfig(t, p, "", "config", "device", "create", "cn33", "--url-file", "/run/secrets/cn33-url")
+	runConfig(t, p, "", "config", "device", "create", "other", "--url-file", "/run/secrets/other-url")
 
 	out1, _, code1 := runConfig(t, p, "", "config", "device", "list", "-o", "json")
 	out2, _, code2 := runConfig(t, p, "", "devices", "-o", "json")
@@ -459,7 +572,7 @@ func TestConfigDeviceListMatchesDevicesAlias(t *testing.T) {
 	if tout1 != tout2 {
 		t.Fatalf("text list %q != devices %q", tout1, tout2)
 	}
-	if !strings.Contains(tout1, "arwen") || !strings.Contains(tout1, "cn33") {
+	if !strings.Contains(tout1, "arwen") || !strings.Contains(tout1, "other") {
 		t.Fatalf("list missing devices: %s", tout1)
 	}
 }
@@ -560,19 +673,19 @@ func TestConfigDeviceShowEnvPassword(t *testing.T) {
 func TestConfigDefault(t *testing.T) {
 	p := freshConfigPath(t)
 	runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
-	runConfig(t, p, "", "config", "device", "create", "cn33", "--url", "https://cn33.example.net")
+	runConfig(t, p, "", "config", "device", "create", "other", "--url", "https://other.example.net")
 
 	out, _, code := runConfig(t, p, "", "config", "default")
 	if code != 0 || !strings.Contains(out, "no default") {
 		t.Fatalf("code %d out %s", code, out)
 	}
 
-	_, stderr, code := runConfig(t, p, "", "config", "default", "cn33")
+	_, stderr, code := runConfig(t, p, "", "config", "default", "other")
 	if code != 0 {
 		t.Fatalf("code %d stderr %s", code, stderr)
 	}
 	out, _, code = runConfig(t, p, "", "config", "default")
-	if code != 0 || strings.TrimSpace(out) != "cn33" {
+	if code != 0 || strings.TrimSpace(out) != "other" {
 		t.Fatalf("code %d out %q", code, out)
 	}
 }
@@ -583,5 +696,122 @@ func TestConfigDefaultUnknownDeviceRefused(t *testing.T) {
 	_, stderr, code := runConfig(t, p, "", "config", "default", "nope")
 	if code != ExitUsage {
 		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+// TestConfigDefaultAlwaysReportsChanged pins that "config default NAME"
+// always includes "changed" in its JSON result (no omitempty hiding a
+// false), and that its text output says "unchanged" the second time,
+// matching create/set.
+func TestConfigDefaultAlwaysReportsChanged(t *testing.T) {
+	p := freshConfigPath(t)
+	runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
+
+	out, stderr, code := runConfig(t, p, "", "config", "default", "arwen", "-o", "json")
+	if code != 0 || !strings.Contains(out, `"changed": true`) {
+		t.Fatalf("first: code %d out %s stderr %s", code, out, stderr)
+	}
+
+	out2, stderr, code := runConfig(t, p, "", "config", "default", "arwen", "-o", "json")
+	if code != 0 || !strings.Contains(out2, `"changed": false`) {
+		t.Fatalf("second: code %d out %s stderr %s", code, out2, stderr)
+	}
+
+	textOut, stderr, code := runConfig(t, p, "", "config", "default", "arwen")
+	if code != 0 || !strings.Contains(textOut, "unchanged") {
+		t.Fatalf("text: code %d out %s stderr %s", code, textOut, stderr)
+	}
+}
+
+// --- error classification ---
+
+// errReader always fails with err, so readPasswordStdin's own read error
+// path (as opposed to an empty result) can be exercised directly.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReadPasswordStdinReadErrorIsUsage(t *testing.T) {
+	_, err := readPasswordStdin(errReader{err: errors.New("boom")})
+	var ue UsageError
+	if !errors.As(err, &ue) {
+		t.Fatalf("want UsageError, got %v (%T)", err, err)
+	}
+}
+
+// TestAbsPathFailureIsUsage forces filepath.Abs to fail by chdir'ing into a
+// directory and then removing it out from under the process, so a
+// relative path can no longer be resolved against the working directory.
+func TestAbsPathFailureIsUsage(t *testing.T) {
+	dir := t.TempDir()
+	gone := filepath.Join(dir, "gone")
+	if err := os.Mkdir(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(gone); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(orig)
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = absPath("relative-path")
+	var ue UsageError
+	if !errors.As(err, &ue) {
+		t.Fatalf("want UsageError, got %v (%T)", err, err)
+	}
+}
+
+// --- config device show: insecure_tls source ---
+
+// TestConfigDeviceShowInsecureTLSSource pins that insecure_tls reports a
+// source too, like url/user/password: "default" when the key is absent
+// from the config file, "value" once it has been set explicitly.
+func TestConfigDeviceShowInsecureTLSSource(t *testing.T) {
+	p := freshConfigPath(t)
+	runConfig(t, p, "", "config", "device", "create", "arwen", "--url", "https://arwen.example.net")
+
+	out, stderr, code := runConfig(t, p, "", "config", "device", "show", "arwen", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("bad json: %v: %s", err, out)
+	}
+	res := result["result"].(map[string]any)
+	tls := res["insecure_tls"].(map[string]any)
+	if tls["source"] != "default" || tls["value"] != false {
+		t.Fatalf("insecure_tls %+v", tls)
+	}
+
+	if _, stderr, code := runConfig(t, p, "", "config", "device", "set", "arwen", "--insecure-tls"); code != 0 {
+		t.Fatalf("set: code %d stderr %s", code, stderr)
+	}
+	out2, stderr, code := runConfig(t, p, "", "config", "device", "show", "arwen", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	var result2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &result2); err != nil {
+		t.Fatalf("bad json: %v: %s", err, out2)
+	}
+	res2 := result2["result"].(map[string]any)
+	tls2 := res2["insecure_tls"].(map[string]any)
+	if tls2["source"] != "value" || tls2["value"] != true {
+		t.Fatalf("insecure_tls %+v", tls2)
+	}
+
+	textOut, stderr, code := runConfig(t, p, "", "config", "device", "show", "arwen")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(textOut, "insecure_tls: value true") {
+		t.Fatalf("text output missing insecure_tls source: %s", textOut)
 	}
 }

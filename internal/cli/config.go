@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/txomon/glinet-pikvm-cli/internal/config"
 )
 
@@ -44,7 +45,7 @@ func absPath(path string) (string, error) {
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("resolve absolute path for %s: %w", path, err)
+		return "", usagef("resolve absolute path for %s: %v", path, err)
 	}
 	return abs, nil
 }
@@ -52,17 +53,32 @@ func absPath(path string) (string, error) {
 // readPasswordStdin reads one line from r, trimming its trailing newline,
 // and refuses an empty result: an empty password read from stdin is always
 // a mistake (empty input, wrong file redirected, and so on), never an
-// intentional way to clear a password (--unset password does that).
+// intentional way to clear a password (--unset password does that). A read
+// failure is a usage error, like every other problem with how
+// --password-stdin was invoked (empty input, both --password-file and
+// --password-stdin given, and so on).
 func readPasswordStdin(r io.Reader) (string, error) {
 	line, err := bufio.NewReader(r).ReadString('\n')
 	if err != nil && err != io.EOF {
-		return "", fmt.Errorf("read stdin: %w", err)
+		return "", usagef("read stdin: %v", err)
 	}
 	line = config.TrimTrailingNewline(line)
 	if line == "" {
 		return "", usagef("--password-stdin requires a non-empty password")
 	}
 	return line, nil
+}
+
+// requireNonEmptyIfChanged refuses an empty value for a flag that was
+// explicitly passed: "--user-file ”" (Changed true, value empty) would
+// otherwise silently store an empty path instead of being caught here.
+// Flags never given at all are unaffected: their zero value just means
+// "nothing given", handled elsewhere.
+func requireNonEmptyIfChanged(f *pflag.FlagSet, flag, value, noun string) error {
+	if f.Changed(flag) && value == "" {
+		return usagef("--%s requires a non-empty %s", flag, noun)
+	}
+	return nil
 }
 
 func rawString(s string) json.RawMessage {
@@ -193,6 +209,16 @@ func newConfigDeviceCreateCmd(g *globals) *cobra.Command {
 				return err
 			}
 		}
+		for _, check := range []struct{ flag, value, noun string }{
+			{"url-file", urlFile, "path"},
+			{"user", user, "value"},
+			{"user-file", userFile, "path"},
+			{"password-file", passwordFile, "path"},
+		} {
+			if err := requireNonEmptyIfChanged(f, check.flag, check.value, check.noun); err != nil {
+				return err
+			}
+		}
 
 		var password string
 		if passwordStdin {
@@ -301,6 +327,16 @@ func newConfigDeviceSetCmd(g *globals) *cobra.Command {
 		}
 		if f.Changed("url") {
 			if err := validateDeviceURL(urlStr); err != nil {
+				return err
+			}
+		}
+		for _, check := range []struct{ flag, value, noun string }{
+			{"url-file", urlFile, "path"},
+			{"user", user, "value"},
+			{"user-file", userFile, "path"},
+			{"password-file", passwordFile, "path"},
+		} {
+			if err := requireNonEmptyIfChanged(f, check.flag, check.value, check.noun); err != nil {
 				return err
 			}
 		}
@@ -568,13 +604,30 @@ type configFieldStatus struct {
 	Readable *bool  `json:"readable,omitempty"`
 }
 
+// configBoolFieldStatus is insecure_tls's status in "config device show"'s
+// result: unlike url/user/password it has no file form, so its only
+// possible sources are "value" (the key is present in the config file) and
+// "default" (the key is absent, so it resolves to false).
+type configBoolFieldStatus struct {
+	Source string `json:"source"`
+	Value  bool   `json:"value"`
+}
+
+func describeBoolField(value, present bool) configBoolFieldStatus {
+	source := "default"
+	if present {
+		source = "value"
+	}
+	return configBoolFieldStatus{Source: source, Value: value}
+}
+
 type configDeviceShowResult struct {
-	Name        string            `json:"name"`
-	URL         configFieldStatus `json:"url"`
-	User        configFieldStatus `json:"user"`
-	Password    configFieldStatus `json:"password"`
-	InsecureTLS bool              `json:"insecure_tls"`
-	Default     bool              `json:"default"`
+	Name        string                `json:"name"`
+	URL         configFieldStatus     `json:"url"`
+	User        configFieldStatus     `json:"user"`
+	Password    configFieldStatus     `json:"password"`
+	InsecureTLS configBoolFieldStatus `json:"insecure_tls"`
+	Default     bool                  `json:"default"`
 }
 
 // describeField builds one field's show status. secret suppresses Value
@@ -600,14 +653,14 @@ func describeField(value, file, defaultValue, envValue string, secret bool) conf
 	}
 }
 
-func buildShowResult(d config.Device, defaultDevice string) configDeviceShowResult {
+func buildShowResult(d config.Device, defaultDevice string, insecureTLSPresent bool) configDeviceShowResult {
 	envPassword := os.Getenv("GLKVM_PASSWORD")
 	return configDeviceShowResult{
 		Name:        d.Name,
 		URL:         describeField(d.URL, d.URLFile, "", "", false),
 		User:        describeField(d.User, d.UserFile, "admin", "", false),
 		Password:    describeField(d.Password, d.PasswordFile, "", envPassword, true),
-		InsecureTLS: d.InsecureTLS,
+		InsecureTLS: describeBoolField(d.InsecureTLS, insecureTLSPresent),
 		Default:     d.Name == defaultDevice,
 	}
 }
@@ -671,13 +724,20 @@ func newConfigDeviceShowCmd(g *globals) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		result := buildShowResult(d, f.DefaultDevice)
+
+		rawFile, err := config.LoadRaw(g.configPath)
+		if err != nil {
+			return err
+		}
+		_, insecureTLSPresent := rawFile.Devices[d.Name]["insecure_tls"]
+
+		result := buildShowResult(d, f.DefaultDevice, insecureTLSPresent)
 		return render(cmd.OutOrStdout(), g.output, result, func(w io.Writer) {
 			fmt.Fprintf(w, "name: %s\n", result.Name)
 			fmt.Fprintf(w, "url: %s\n", fieldLine(result.URL))
 			fmt.Fprintf(w, "user: %s\n", fieldLine(result.User))
 			fmt.Fprintf(w, "password: %s\n", passwordLine(result.Password))
-			fmt.Fprintf(w, "insecure_tls: %v\n", result.InsecureTLS)
+			fmt.Fprintf(w, "insecure_tls: %s %v\n", result.InsecureTLS.Source, result.InsecureTLS.Value)
 			fmt.Fprintf(w, "default: %v\n", result.Default)
 		})
 	}
@@ -688,7 +748,7 @@ func newConfigDeviceShowCmd(g *globals) *cobra.Command {
 
 type configDefaultResult struct {
 	Default string `json:"default"`
-	Changed bool   `json:"changed,omitempty"`
+	Changed bool   `json:"changed"`
 }
 
 func newConfigDefaultCmd(g *globals) *cobra.Command {
@@ -733,7 +793,11 @@ func newConfigDefaultCmd(g *globals) *cobra.Command {
 		}
 		result := configDefaultResult{Default: name, Changed: changed}
 		return render(cmd.OutOrStdout(), g.output, result, func(w io.Writer) {
-			fmt.Fprintf(w, "default device: %s\n", name)
+			verb := "unchanged"
+			if result.Changed {
+				verb = "changed"
+			}
+			fmt.Fprintf(w, "default device %q: %s\n", name, verb)
 		})
 	}
 	return cmd
