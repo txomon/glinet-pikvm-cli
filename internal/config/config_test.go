@@ -202,3 +202,48 @@ func TestTrimTrailingNewline(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadBothConsistentWithLoadAndLoadRaw pins that LoadBoth's typed and
+// raw views describe the same file: both come from one read of the same
+// bytes, so "config device show" (LoadBoth's only caller) can never mix a
+// device resolved from one snapshot with a raw key presence check from a
+// different one.
+func TestLoadBothConsistentWithLoadAndLoadRaw(t *testing.T) {
+	cfg := `{"devices":{"a":{"url":"https://a.example","insecure_tls":true}},"default_device":"a"}`
+	p := write(t, cfg, 0o600)
+
+	f, rf, err := LoadBoth(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantF, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRF, err := LoadRaw(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if f.DefaultDevice != wantF.DefaultDevice || len(f.Devices) != len(wantF.Devices) {
+		t.Fatalf("File mismatch: %+v vs %+v", f, wantF)
+	}
+	d, ok := f.Devices["a"]
+	if !ok || d.URL != "https://a.example" || !d.InsecureTLS {
+		t.Fatalf("device %+v", d)
+	}
+
+	if len(rf.Devices) != len(wantRF.Devices) {
+		t.Fatalf("RawFile mismatch: %+v vs %+v", rf, wantRF)
+	}
+	if _, ok := rf.Devices["a"]["insecure_tls"]; !ok {
+		t.Fatal("insecure_tls key missing from raw view")
+	}
+}
+
+func TestLoadBothMissingFileIsError(t *testing.T) {
+	_, _, err := LoadBoth(filepath.Join(t.TempDir(), "absent.json"))
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("want ErrConfig, got %v", err)
+	}
+}

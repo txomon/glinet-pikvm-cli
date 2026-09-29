@@ -96,7 +96,13 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 	var d config.Device
 	haveDevice := false
 	if f != nil {
-		fileCheckFailed := false
+		// failedPaths collects the exact paths a file reference check
+		// below found unreadable, so f.Device's own resolution error can
+		// be suppressed only when it names one of those same paths, not
+		// whenever any file check failed for the device: an unrelated
+		// resolution error (e.g. "device has no url") must still be
+		// reported even when some other referenced file is unreadable.
+		failedPaths := map[string]bool{}
 		if raw, rawErr := f.Lookup(deviceName); rawErr == nil {
 			for _, ref := range []struct{ field, path string }{
 				{"url_file", raw.URLFile},
@@ -108,7 +114,7 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 				}
 				if checkErr := config.CheckFileReadable(ref.path); checkErr != nil {
 					configOK = false
-					fileCheckFailed = true
+					failedPaths[ref.path] = true
 					appendDetail(fmt.Sprintf("%s %s: unreadable: %v", ref.field, ref.path, checkErr))
 				} else {
 					appendDetail(fmt.Sprintf("%s %s: readable", ref.field, ref.path))
@@ -119,11 +125,20 @@ func doDoctor(ctx context.Context, configPath, deviceName string, timeout time.D
 		dev, devErr := f.Device(deviceName)
 		if devErr != nil {
 			configOK = false
-			// Skip the resolution error's own text when a file reference
-			// check above already failed for this device: f.Device's
-			// failure is the same missing/unreadable file, restated, and
-			// printing both just says the same thing twice.
-			if !fileCheckFailed {
+			// f.Device's error names the path it failed on (see
+			// readFileValue); when that path is one already reported
+			// above, this is the same problem restated, so skip it.
+			// Anything else (a different path, or no path at all, as with
+			// "device has no url") is a distinct problem and still needs
+			// to be shown.
+			redundant := false
+			for path := range failedPaths {
+				if strings.Contains(devErr.Error(), path) {
+					redundant = true
+					break
+				}
+			}
+			if !redundant {
 				appendDetail(devErr.Error())
 			}
 		} else {

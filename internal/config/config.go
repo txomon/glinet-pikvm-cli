@@ -60,6 +60,36 @@ func Load(path string) (*File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: read %s: %v", ErrConfig, path, err)
 	}
+	return parseFile(path, b)
+}
+
+// LoadBoth reads path exactly once and returns both the typed File view
+// (used to look up or resolve a device) and the RawFile view (used to
+// inspect a device's exact configured keys, such as whether insecure_tls
+// was set at all rather than defaulted). A caller that needs both, such as
+// "config device show", must build them from the same read: two separate
+// Load/LoadRaw calls could each see a different version of the file if a
+// write landed in between, showing an inconsistent snapshot. Like Load
+// (and unlike LoadRaw), a missing file is an error here.
+func LoadBoth(path string) (*File, *RawFile, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: read %s: %v", ErrConfig, path, err)
+	}
+	f, err := parseFile(path, b)
+	if err != nil {
+		return nil, nil, err
+	}
+	rf, err := parseRawFile(path, b)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, rf, nil
+}
+
+// parseFile parses b (path's already-read content, named only for error
+// messages) as a File, applying Load's value/file-conflict validation.
+func parseFile(path string, b []byte) (*File, error) {
 	var f File
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("%w: parse %s: %v", ErrConfig, path, err)

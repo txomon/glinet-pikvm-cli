@@ -36,15 +36,20 @@ func emptyRawFile() *RawFile {
 // returns an empty RawFile, so a config command can create the file and
 // its directory on first use.
 func LoadRaw(path string) (*RawFile, error) {
-	rf := emptyRawFile()
-
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return rf, nil
+		return emptyRawFile(), nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: read %s: %v", ErrConfig, path, err)
 	}
+	return parseRawFile(path, b)
+}
+
+// parseRawFile parses b (path's already-read content, named only for error
+// messages) as a RawFile.
+func parseRawFile(path string, b []byte) (*RawFile, error) {
+	rf := emptyRawFile()
 
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(b, &top); err != nil {
@@ -168,18 +173,59 @@ func atomicWrite(path string, data []byte) error {
 // config.json at a file in the read-only nix store, for example): resolving
 // first means the rename lands on the symlink's target instead, and a
 // read-only target then fails the write loudly rather than silently eating
-// the symlink. A path that does not exist yet (the common case for a brand
-// new config) resolves to itself: there is nothing to follow.
+// the symlink.
+//
+// filepath.EvalSymlinks fails to fully resolve path in two different
+// situations that must not be confused: path itself does not exist at all
+// (the common case for a brand new config, which resolves to itself, since
+// there is nothing to follow), and path exists but is a dangling symlink,
+// one whose ultimate target does not exist. In the second case the write
+// must still land at that target (creating it) and leave every symlink hop
+// in the chain in place, so a dangling symlink is walked by hand one hop at
+// a time with Lstat/Readlink; a target whose own parent directory does not
+// exist yet is a config error naming that target, since the write could
+// never land there.
 func resolveWritePath(path string) (string, error) {
-	resolved, err := filepath.EvalSymlinks(path)
-	switch {
-	case err == nil:
+	resolved, evalErr := filepath.EvalSymlinks(path)
+	if evalErr == nil {
 		return resolved, nil
-	case os.IsNotExist(err):
-		return path, nil
-	default:
-		return "", fmt.Errorf("%w: resolve %s: %v", ErrConfig, path, err)
 	}
+
+	const maxHops = 40 // generous; real chains are one or two hops deep
+	current := path
+	for i := 0; i < maxHops; i++ {
+		lst, lstErr := os.Lstat(current)
+		switch {
+		case os.IsNotExist(lstErr) && current == path:
+			// path itself was never created: nothing to preserve.
+			return path, nil
+		case os.IsNotExist(lstErr):
+			// current is the (missing) target of the symlink chain
+			// starting at path: write there, as long as its directory
+			// already exists.
+			if _, err := os.Stat(filepath.Dir(current)); err != nil {
+				return "", fmt.Errorf("%w: symlink %s target %s: parent directory: %v", ErrConfig, path, current, err)
+			}
+			return current, nil
+		case lstErr != nil:
+			return "", fmt.Errorf("%w: resolve %s: %v", ErrConfig, path, lstErr)
+		case lst.Mode()&os.ModeSymlink == 0:
+			// Exists, is not a symlink, yet EvalSymlinks still could not
+			// resolve the overall path (some other component of it must
+			// be the problem): surface EvalSymlinks' own error.
+			return "", fmt.Errorf("%w: resolve %s: %v", ErrConfig, path, evalErr)
+		}
+
+		target, rlErr := os.Readlink(current)
+		if rlErr != nil {
+			return "", fmt.Errorf("%w: read symlink %s: %v", ErrConfig, current, rlErr)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = target
+	}
+	return "", fmt.Errorf("%w: resolve %s: too many levels of symlinks", ErrConfig, path)
 }
 
 // WithLocked runs fn with the config file at path locked against concurrent

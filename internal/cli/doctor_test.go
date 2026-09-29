@@ -167,3 +167,55 @@ func TestDoctorFailsWhenReferencedFileUnreadable(t *testing.T) {
 		t.Fatalf("f.Device's redundant resolution error was not suppressed: %q", configDetail)
 	}
 }
+
+// doctorConfigDetail writes cfg as the config file, runs doctor against it,
+// and returns the "config" check's detail text.
+func doctorConfigDetail(t *testing.T, cfg map[string]any) string {
+	t.Helper()
+	b, _ := json.Marshal(cfg)
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	code := Execute([]string{"--config", p, "doctor", "-o", "json"}, strings.NewReader(""), &out, &errb)
+	if code != ExitDevice {
+		t.Fatalf("code %d out %s err %s", code, out.String(), errb.String())
+	}
+	var envelope struct {
+		Result []doctorCheck `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &envelope); err != nil {
+		t.Fatalf("bad json: %v: %s", err, out.String())
+	}
+	for _, c := range envelope.Result {
+		if c.Name == "config" {
+			return c.Detail
+		}
+	}
+	t.Fatalf("no config check in %s", out.String())
+	return ""
+}
+
+// TestDoctorReportsUnrelatedResolutionErrorAlongsideUnreadableFile is a
+// regression test: a single fileCheckFailed bool used to suppress ALL of
+// f.Device's error text once ANY referenced file failed its readability
+// check, even when that error was for a completely different, unrelated
+// problem (no url configured at all). The suppression must be scoped to
+// only the specific field/path a file check already reported.
+func TestDoctorReportsUnrelatedResolutionErrorAlongsideUnreadableFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	configDetail := doctorConfigDetail(t, map[string]any{
+		"devices": map[string]any{"t": map[string]any{
+			"user":          "admin",
+			"password_file": missing,
+		}},
+		"default_device": "t",
+	})
+	if !strings.Contains(configDetail, "password_file") || !strings.Contains(configDetail, "unreadable") {
+		t.Fatalf("missing per-file readability detail: %q", configDetail)
+	}
+	if !strings.Contains(configDetail, "has no url") {
+		t.Fatalf("unrelated resolution error (no url) was dropped: %q", configDetail)
+	}
+}
