@@ -23,9 +23,16 @@ type Client struct {
 	// normal request timeout. It shares http's Transport. The context passed
 	// to each request still bounds it.
 	uploadHTTP *http.Client
-	baseURL    string
-	user       string
-	password   string
+	// transport is shared by http and uploadHTTP, and reused by Webterm to
+	// build its own http.Client (same TLS config, but redirects disabled so
+	// an auth-rejecting 302 is visible instead of silently followed).
+	transport *http.Transport
+	baseURL   string
+	// deviceURL is baseURL without the trailing "/api", for endpoints (like
+	// the webterm websocket) that nginx serves outside the kvmd API.
+	deviceURL string
+	user      string
+	password  string
 }
 
 // New builds a Client for d. Requests time out after timeout.
@@ -34,10 +41,13 @@ func New(d config.Device, timeout time.Duration) *Client {
 	if d.InsecureTLS {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
+	trimmed := strings.TrimRight(d.URL, "/")
 	return &Client{
 		http:       &http.Client{Timeout: timeout, Transport: tr},
 		uploadHTTP: &http.Client{Transport: tr},
-		baseURL:    strings.TrimRight(d.URL, "/") + "/api",
+		transport:  tr,
+		baseURL:    trimmed + "/api",
+		deviceURL:  trimmed,
 		user:       d.User,
 		password:   d.Password,
 	}

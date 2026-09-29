@@ -175,6 +175,19 @@ type Server struct {
 	infoDoc    map[string]any
 	versionDoc map[string]any
 	hidDoc     map[string]any
+
+	// WebtermHandshake is the columns/rows from the webterm websocket's
+	// initial client handshake, and WebtermResizes each '1' resize frame
+	// received afterward, in order. Both are set by handleWebterm.
+	WebtermHandshake WebtermSize
+	WebtermResizes   []WebtermSize
+}
+
+// WebtermSize is a terminal size recorded by the webterm bridge, either from
+// the initial handshake or a later resize frame.
+type WebtermSize struct {
+	Columns int
+	Rows    int
 }
 
 // loadResult reads testdata/<name>.json, expects the standard
@@ -442,6 +455,16 @@ func (f *Server) newMux() http.Handler {
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		// The webterm websocket is a long-lived connection, unlike every
+		// other route here; it must not hold f.mu (taken below for the rest
+		// of this request's lifetime) for as long as it stays open, or every
+		// other simulated request would block until the shell session ends.
+		// It takes f.mu itself, briefly, whenever it touches shared state.
+		if r.URL.Path == webtermWSPath {
+			f.handleWebterm(w, r, body)
+			return
+		}
 
 		f.mu.Lock()
 		defer f.mu.Unlock()
