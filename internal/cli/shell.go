@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -69,13 +70,23 @@ const ctrlCloseByte = 0x1d
 // io.Reader/io.Writer values and a resize channel fed by hand.
 //
 // It returns as soon as any one of the three ends, without waiting for the
-// others: in production, once the remote shell exits, the interactive
-// command must return promptly even though the goroutine blocked reading
-// local stdin has no way to be interrupted (a real terminal's stdin has no
-// read deadline); that goroutine is left to exit when the process itself
-// does.
+// goroutine blocked reading local stdin: in production, once the remote
+// shell exits, the interactive command must return promptly, and that
+// goroutine's in.Read has no way to be interrupted (a real terminal's stdin
+// has no read deadline), so it is left to exit when the process itself
+// does. The output and resize goroutines are different: both take a
+// context derived from ctx, so before returning, shellRelay cancels it and
+// waits for both to exit, which unblocks a resize goroutine parked on the
+// resize channel and a ReadOutput call blocked on conn. This guarantees
+// neither goroutine is still writing to out or warn once shellRelay has
+// returned, which a caller (or test) could otherwise observe as a data
+// race.
 func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writer, resize <-chan [2]int, warn io.Writer) error {
 	doneCh := make(chan error, 2)
+
+	relayCtx, relayCancel := context.WithCancel(ctx)
+	defer relayCancel()
+	var wg sync.WaitGroup
 
 	go func() {
 		buf := make([]byte, 4096)
@@ -105,9 +116,11 @@ func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writ
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
-			data, err := conn.ReadOutput(ctx)
+			data, err := conn.ReadOutput(relayCtx)
 			if err != nil {
 				doneCh <- err
 				return
@@ -119,10 +132,12 @@ func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writ
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-relayCtx.Done():
 				return
 			case sz, ok := <-resize:
 				if !ok {
@@ -136,6 +151,8 @@ func shellRelay(ctx context.Context, conn webtermConn, in io.Reader, out io.Writ
 	}()
 
 	err := <-doneCh
+	relayCancel()
+	wg.Wait()
 	if errors.Is(err, errShellEscape) {
 		return errShellEscape
 	}
