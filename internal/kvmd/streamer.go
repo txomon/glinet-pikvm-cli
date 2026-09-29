@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
+	"regexp"
+	"strconv"
 )
 
 // StreamerState is the parsed shape of GET /streamer's source and hdmi info.
@@ -18,17 +19,50 @@ type StreamerState struct {
 	HDMISignal     bool
 }
 
-// Valid reports whether s reflects a usable capture: online, a positive
-// resolution, and a real_resolution that is neither a rejected mode nor
-// "no signal". It returns nil when usable, otherwise an error quoting
-// RealResolution.
-func (s StreamerState) Valid() error {
-	if s.Online && s.Width > 0 && s.Height > 0 &&
-		!strings.HasPrefix(s.RealResolution, "invalid_resolution:") &&
-		s.RealResolution != "no signal" {
-		return nil
+// realResolutionRe matches the "<W>x<H>@<F>" shape of a settled
+// real_resolution, such as "1200x752@60". Anything else (a bare
+// "no signal", the device's own "no_signal", an "invalid_resolution:"
+// prefixed value, or an empty string) does not match.
+var realResolutionRe = regexp.MustCompile(`^([0-9]+)x([0-9]+)@[0-9.]+$`)
+
+// ParsedResolution reports the width and height that RealResolution decodes
+// to, when it matches "<W>x<H>@<F>". ok is false when it does not parse.
+func (s StreamerState) ParsedResolution() (w, h int, ok bool) {
+	m := realResolutionRe.FindStringSubmatch(s.RealResolution)
+	if m == nil {
+		return 0, 0, false
 	}
-	return fmt.Errorf("streamer capture is not usable, real_resolution %q", s.RealResolution)
+	w, err1 := strconv.Atoi(m[1])
+	h, err2 := strconv.Atoi(m[2])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+// Valid reports whether s reflects a usable, settled capture: the source is
+// online, the HDMI link has signal, real_resolution parses as "<W>x<H>@<F>",
+// and that parsed W,H matches the separately reported Width,Height. A real
+// device passes through several inconsistent in-between states (hdmi signal
+// down, real_resolution briefly "no_signal", real_resolution updated before
+// the reported resolution catches up) while a capture settles; each of
+// those is invalid here. Valid returns nil when settled, otherwise an error
+// quoting RealResolution and naming which condition failed.
+func (s StreamerState) Valid() error {
+	if !s.Online {
+		return fmt.Errorf("streamer capture is not usable: source offline, real_resolution %q", s.RealResolution)
+	}
+	if !s.HDMISignal {
+		return fmt.Errorf("streamer capture is not usable: hdmi signal down, real_resolution %q", s.RealResolution)
+	}
+	w, h, ok := s.ParsedResolution()
+	if !ok {
+		return fmt.Errorf("streamer capture is not usable: real_resolution %q does not parse as WxH@F", s.RealResolution)
+	}
+	if w != s.Width || h != s.Height {
+		return fmt.Errorf("streamer capture is not usable: real_resolution %q does not match reported resolution %dx%d", s.RealResolution, s.Width, s.Height)
+	}
+	return nil
 }
 
 // streamerResponse is the shape of GET /streamer this client uses.

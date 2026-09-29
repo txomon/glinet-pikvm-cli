@@ -192,6 +192,15 @@ func doEdidSet(ctx context.Context, c *kvmd.Client, profile, file string, force 
 		Mode:    mode.String(),
 	}
 
+	// Wait for the capture to both become valid and land on the flashed
+	// mode's own resolution: a real device passes through several
+	// intermediate states (hdmi signal down, real_resolution briefly
+	// "no_signal", real_resolution ahead of the reported resolution) that
+	// StreamerState.Valid alone rejects, but it can also settle on a valid
+	// capture that never adopted the flashed mode at all (the downstream
+	// source declined to renegotiate). Either way this waits out the full
+	// settle duration before giving up; it never returns early on a valid
+	// capture at the wrong resolution.
 	settleCtx, cancel := context.WithTimeout(ctx, settle)
 	defer cancel()
 	var last kvmd.StreamerState
@@ -201,15 +210,22 @@ func doEdidSet(ctx context.Context, c *kvmd.Client, profile, file string, force 
 			return false, err
 		}
 		last = st
-		return st.Valid() == nil, nil
+		if st.Valid() != nil {
+			return false, nil
+		}
+		return st.Width == mode.Width && st.Height == mode.Height, nil
 	})
 	if waitErr != nil && !errors.Is(waitErr, context.DeadlineExceeded) {
 		return edidSetResult{}, waitErr
 	}
-	if last.Valid() == nil {
-		result.Capture = last.RealResolution
-	} else {
+
+	switch {
+	case last.Valid() != nil:
 		result.Capture = "no signal"
+	case last.Width == mode.Width && last.Height == mode.Height:
+		result.Capture = last.RealResolution
+	default:
+		result.Capture = fmt.Sprintf("%s (does not match flashed mode %s)", last.RealResolution, mode)
 	}
 
 	return result, nil

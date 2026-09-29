@@ -32,7 +32,10 @@ func fixChecksum(t *testing.T, hexStr string) string {
 
 func TestEdidSetProfileFlashesAndReadsBack(t *testing.T) {
 	f := kvmdfake.New(t)
-	out, stderr, code := runCLI(t, f, "edid", "set", "4k", "-o", "json")
+	// The fake never moves its streamer resolution to match a flashed
+	// profile (see TestEdidSetSettlesThroughStages for that), so without a
+	// short --settle this would wait out the full 15s default every time.
+	out, stderr, code := runCLI(t, f, "edid", "set", "4k", "--settle", "50ms", "-o", "json")
 	if code != 0 {
 		t.Fatalf("code %d out %s err %s", code, out, stderr)
 	}
@@ -93,12 +96,39 @@ func TestEdidUnknownProfile(t *testing.T) {
 // branch (a Task 7 reviewer flagged that branch as untested).
 func TestEdidSetThenStatusReportsProfile(t *testing.T) {
 	f := kvmdfake.New(t)
-	_, stderr, code := runCLI(t, f, "edid", "set", "4k")
+	_, stderr, code := runCLI(t, f, "edid", "set", "4k", "--settle", "50ms")
 	if code != 0 {
 		t.Fatalf("set code %d stderr %s", code, stderr)
 	}
 	out, _, code := runCLI(t, f, "status", "-o", "json")
 	if code != 0 || !strings.Contains(out, `"profile": "4k"`) {
 		t.Fatalf("code %d out %s", code, out)
+	}
+}
+
+// TestEdidSetSettlesThroughStages plays the exact five-stage transition a
+// live device was observed to go through after a flash (hdmi signal drops,
+// real_resolution briefly reports "no_signal", real_resolution updates
+// ahead of the reported resolution, hdmi signal returns, and only then does
+// the reported resolution catch up) and confirms "edid set" reports the new
+// resolution only once every field has settled, never on an earlier stage.
+func TestEdidSetSettlesThroughStages(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.ScriptStreamer(
+		kvmdfake.StreamerStage{Online: true, HDMISignal: false, Real: "800x600@60", Width: 800, Height: 600},
+		kvmdfake.StreamerStage{Online: true, HDMISignal: false, Real: "no_signal", Width: 800, Height: 600},
+		kvmdfake.StreamerStage{Online: true, HDMISignal: false, Real: "1920x1080@60", Width: 800, Height: 600},
+		kvmdfake.StreamerStage{Online: true, HDMISignal: true, Real: "1920x1080@60", Width: 800, Height: 600},
+		kvmdfake.StreamerStage{Online: true, HDMISignal: true, Real: "1920x1080@60", Width: 1920, Height: 1080},
+	)
+	out, stderr, code := runCLI(t, f, "edid", "set", "1k", "--settle", "3s", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d out %s err %s", code, out, stderr)
+	}
+	if !strings.Contains(out, `"capture": "1920x1080@60"`) {
+		t.Fatalf("did not report the settled resolution: out %s", out)
+	}
+	if strings.Contains(out, "800x600") || strings.Contains(out, "no_signal") {
+		t.Fatalf("reported an intermediate stage instead of waiting: out %s", out)
 	}
 }

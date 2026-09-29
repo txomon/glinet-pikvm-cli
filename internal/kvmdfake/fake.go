@@ -102,6 +102,11 @@ type Server struct {
 	MSD            MSDState
 	FailNext       map[string]Failure
 
+	// streamerScript, when non-empty, is consumed one stage per GET
+	// /streamer call: routeStreamer applies its first entry to the fields
+	// above and pops it, so a test can play a scripted settle sequence.
+	streamerScript []StreamerStage
+
 	switchDoc  map[string]any
 	infoDoc    map[string]any
 	versionDoc map[string]any
@@ -243,20 +248,51 @@ func (f *Server) CurrentEDID() string {
 	return f.EDID
 }
 
-// SetSource updates the streamer's capture state. w and h are the reported
-// source resolution; a snapshot is only regenerated at this size when both
-// are positive, since a JPEG cannot be encoded at zero size and the offline
-// case never reads it.
+// SetSource updates the streamer's capture state, setting the HDMI signal
+// to match online. w and h are the reported source resolution; a snapshot
+// is only regenerated at this size when both are positive, since a JPEG
+// cannot be encoded at zero size and the offline case never reads it.
 func (f *Server) SetSource(online bool, real string, w, h int) {
+	f.SetStreamer(online, online, real, w, h)
+}
+
+// SetStreamer updates every field of the streamer's capture state
+// independently, unlike SetSource which always ties HDMI signal to online.
+// It models the real device's transitional states after an EDID flash or a
+// port switch, where online, hdmi signal, real_resolution and the reported
+// resolution can each lag the others by one or more polls.
+func (f *Server) SetStreamer(online, hdmiSignal bool, real string, w, h int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.SourceOnline = online
+	f.HDMISignal = hdmiSignal
 	f.RealResolution = real
 	f.Width = w
 	f.Height = h
 	if w > 0 && h > 0 {
 		f.SnapshotJPEG = generateSnapshot(w, h)
 	}
+}
+
+// StreamerStage is one snapshot of the fake's streamer state, for scripting
+// a sequence of transitions with ScriptStreamer.
+type StreamerStage struct {
+	Online     bool
+	HDMISignal bool
+	Real       string
+	Width      int
+	Height     int
+}
+
+// ScriptStreamer queues a sequence of streamer stages. Each GET /streamer
+// call applies and pops the first queued stage; once the queue is empty,
+// the fake reports whatever state SetSource/SetStreamer last set, as usual.
+// This lets a test play a real device's multi-poll settle sequence without
+// wall-clock sleeps.
+func (f *Server) ScriptStreamer(stages ...StreamerStage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streamerScript = append([]StreamerStage(nil), stages...)
 }
 
 // newMux builds the routed handler, wrapped with the shared middleware that
@@ -382,6 +418,15 @@ func (f *Server) routeSetActivePrev(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *Server) routeStreamer(w http.ResponseWriter, r *http.Request) {
+	if len(f.streamerScript) > 0 {
+		stage := f.streamerScript[0]
+		f.streamerScript = f.streamerScript[1:]
+		f.SourceOnline = stage.Online
+		f.HDMISignal = stage.HDMISignal
+		f.RealResolution = stage.Real
+		f.Width = stage.Width
+		f.Height = stage.Height
+	}
 	ok(w, map[string]any{
 		"streamer": map[string]any{
 			"source": map[string]any{
