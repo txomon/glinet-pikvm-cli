@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/txomon/glinet-pikvm-cli/internal/kvmdfake"
 )
@@ -68,6 +69,16 @@ func otgCalls(f *kvmdfake.Server) []kvmdfake.Call {
 	var out []kvmdfake.Call
 	for _, c := range f.Calls() {
 		if c.Path == "/api/system/otg_functions" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func otgPOSTs(f *kvmdfake.Server) []kvmdfake.Call {
+	var out []kvmdfake.Call
+	for _, c := range otgCalls(f) {
+		if c.Method == "POST" {
 			out = append(out, c)
 		}
 	}
@@ -240,5 +251,135 @@ func TestMSDUploadNotEnoughFreeSpace(t *testing.T) {
 		if c.Path == "/api/msd/write" {
 			t.Fatal("upload reached the device despite insufficient free space")
 		}
+	}
+}
+
+// TestMSDAttachRetriesAfterApplyError pins fix round 1's finding 1: once an
+// apply has failed, start_cdrom already equals the target value, so without
+// a retry ensureStartCDROM would keep reading the same stale apply_error
+// back forever and every later attach would fail identically.
+func TestMSDAttachRetriesAfterApplyError(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := writeImage(t, "a.img")
+	if _, e, code := runCLI(t, f, "msd", "upload", p); code != 0 {
+		t.Fatalf("upload: code %d %s", code, e)
+	}
+	f.FailOTGApply("gadget rebuild failed")
+
+	_, stderr, code := runCLI(t, f, "msd", "attach", "a.img")
+	if code == 0 || !strings.Contains(stderr, "gadget rebuild failed") {
+		t.Fatalf("first attach: code %d stderr %s", code, stderr)
+	}
+	firstPOSTs := len(otgPOSTs(f))
+
+	// FailOTGApply is single-shot: the fake no longer fails the next apply.
+	_, stderr, code = runCLI(t, f, "msd", "attach", "a.img")
+	if code != 0 {
+		t.Fatalf("second attach: code %d stderr %s", code, stderr)
+	}
+	if len(otgPOSTs(f)) <= firstPOSTs {
+		t.Fatal("no new POST to otg_functions on retry after a stale apply_error")
+	}
+	if f.OTG.ApplyError != "" {
+		t.Fatalf("apply_error still set after a successful retry: %q", f.OTG.ApplyError)
+	}
+}
+
+func TestMSDUploadReplaceHappyPath(t *testing.T) {
+	f := kvmdfake.New(t)
+	p1 := writeImage(t, "a.img")
+	if _, e, code := runCLI(t, f, "msd", "upload", p1); code != 0 {
+		t.Fatalf("initial upload: code %d %s", code, e)
+	}
+
+	p2 := filepath.Join(t.TempDir(), "newer.img")
+	if err := os.WriteFile(p2, []byte("yyyy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, stderr, code := runCLI(t, f, "msd", "upload", p2, "--name", "a.img", "--replace", "-o", "json")
+	if code != 0 {
+		t.Fatalf("replace upload: code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(out, `"replaced": true`) || !strings.Contains(out, `"size": 4`) {
+		t.Fatalf("out %s", out)
+	}
+}
+
+func TestMSDUploadReplaceRefusesConnectedImage(t *testing.T) {
+	f := kvmdfake.New(t)
+	p := writeImage(t, "a.img")
+	runCLI(t, f, "msd", "upload", p)
+	if _, e, code := runCLI(t, f, "msd", "attach", "a.img"); code != 0 {
+		t.Fatalf("attach: code %d %s", code, e)
+	}
+
+	p2 := filepath.Join(t.TempDir(), "newer.img")
+	if err := os.WriteFile(p2, []byte("yyyy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	before := len(f.Calls())
+	_, stderr, code := runCLI(t, f, "msd", "upload", p2, "--name", "a.img", "--replace")
+	if code != ExitUsage || !strings.Contains(stderr, "detach") {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	for _, c := range f.Calls()[before:] {
+		if c.Path == "/api/msd/remove" || c.Path == "/api/msd/write" {
+			t.Fatalf("device modified despite refusal: %+v", c)
+		}
+	}
+}
+
+func TestMSDRemoveWaitsForDisappearance(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.MSDRemoveDelayPolls = 2
+	p := writeImage(t, "a.img")
+	runCLI(t, f, "msd", "upload", p)
+
+	_, stderr, code := runCLI(t, f, "msd", "remove", "a.img")
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+func TestMSDRemoveTimesOutWhenStorageNeverCatchesUp(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.MSDRemoveDelayPolls = 1000
+	p := writeImage(t, "a.img")
+	runCLI(t, f, "msd", "upload", p)
+
+	orig := msdConfirmTimeout
+	msdConfirmTimeout = 300 * time.Millisecond
+	defer func() { msdConfirmTimeout = orig }()
+
+	_, stderr, code := runCLI(t, f, "msd", "remove", "a.img")
+	if code == 0 || !strings.Contains(stderr, "still listed") {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+func TestMSDUploadWaitsForAppearance(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.MSDWriteDelayPolls = 2
+	p := writeImage(t, "a.img")
+	_, stderr, code := runCLI(t, f, "msd", "upload", p)
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+func TestMSDUploadTimesOutWhenStorageNeverCatchesUp(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.MSDWriteDelayPolls = 1000
+	p := writeImage(t, "a.img")
+
+	orig := msdConfirmTimeout
+	msdConfirmTimeout = 300 * time.Millisecond
+	defer func() { msdConfirmTimeout = orig }()
+
+	_, stderr, code := runCLI(t, f, "msd", "upload", p)
+	if code == 0 || !strings.Contains(stderr, "did not appear complete") {
+		t.Fatalf("code %d stderr %s", code, stderr)
 	}
 }

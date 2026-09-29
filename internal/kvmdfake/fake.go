@@ -122,6 +122,28 @@ type Server struct {
 	OTG            OTGState
 	FailNext       map[string]Failure
 
+	// MSDRemoveDelayPolls, when > 0, makes POST /msd/remove leave the image
+	// in storage.images for this many subsequent GET /msd calls before it
+	// disappears, instead of deleting it immediately (the default, 0). This
+	// models a real, observed lag: kvmd's storage listing kept reporting an
+	// image gone from the device for a few seconds after the remove call
+	// that deleted it already succeeded.
+	MSDRemoveDelayPolls int
+	// MSDWriteDelayPolls is MSDRemoveDelayPolls's write-side counterpart: a
+	// just-uploaded image is withheld from storage.images for this many
+	// subsequent GET /msd calls before it appears, instead of appearing
+	// immediately (the default, 0).
+	MSDWriteDelayPolls int
+
+	// msdPendingRemove counts down, per image name, the GET /msd calls
+	// still owed before a delayed removal actually deletes the image from
+	// MSD.Images (set by routeMSDRemove when MSDRemoveDelayPolls > 0).
+	msdPendingRemove map[string]int
+	// msdPendingHide counts down, per image name, the GET /msd calls that
+	// still hide an image already stored in MSD.Images (set by
+	// routeMSDWrite when MSDWriteDelayPolls > 0).
+	msdPendingHide map[string]int
+
 	// otgFailNext, when non-empty, is consumed by the next POST
 	// /system/otg_functions: it reports this as that apply's apply_error
 	// (and clears itself), instead of the usual empty string. Set through
@@ -229,10 +251,12 @@ func New(t testing.TB) *Server {
 		},
 		// start_cdrom off by default, matching the real device's factory
 		// setting and msd.json's captured "online": false.
-		OTG:        OTGState{StartCDROM: false, StartFlash: false, Ready: true, Applying: false},
-		FailNext:   map[string]Failure{},
-		failOn:     map[string][]failOnEntry{},
-		callCounts: map[string]int{},
+		OTG:              OTGState{StartCDROM: false, StartFlash: false, Ready: true, Applying: false},
+		FailNext:         map[string]Failure{},
+		msdPendingRemove: map[string]int{},
+		msdPendingHide:   map[string]int{},
+		failOn:           map[string][]failOnEntry{},
+		callCounts:       map[string]int{},
 
 		switchDoc:  loadResult("switch"),
 		infoDoc:    loadResult("info"),
@@ -620,8 +644,39 @@ func msdImageState(img *MSDImage) map[string]any {
 }
 
 func (f *Server) routeMSD(w http.ResponseWriter, r *http.Request) {
+	// Compute this call's hidden set from each pending write-delay's current
+	// count (before decrementing), so an image withheld for N calls is
+	// actually hidden for exactly N calls: the call whose decrement reaches
+	// zero still hides it this time and only stops on the next one.
+	hiddenNow := map[string]bool{}
+	for name, cnt := range f.msdPendingHide {
+		hiddenNow[name] = true
+		if cnt <= 1 {
+			delete(f.msdPendingHide, name)
+		} else {
+			f.msdPendingHide[name] = cnt - 1
+		}
+	}
+
+	// Collect this call's delayed deletions but apply them only after the
+	// response below is built, so an image withheld for N calls is still
+	// shown on the call whose decrement reaches zero, and gone starting the
+	// next one (symmetric with hiddenNow above).
+	var deferredDelete []string
+	for name, cnt := range f.msdPendingRemove {
+		if cnt <= 1 {
+			deferredDelete = append(deferredDelete, name)
+			delete(f.msdPendingRemove, name)
+		} else {
+			f.msdPendingRemove[name] = cnt - 1
+		}
+	}
+
 	images := map[string]any{}
 	for name, img := range f.MSD.Images {
+		if hiddenNow[name] {
+			continue
+		}
 		images[name] = msdImageState(img)
 	}
 
@@ -654,6 +709,10 @@ func (f *Server) routeMSD(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
+
+	for _, name := range deferredDelete {
+		delete(f.MSD.Images, name)
+	}
 }
 
 func (f *Server) routeMSDWrite(w http.ResponseWriter, r *http.Request) {
@@ -668,6 +727,11 @@ func (f *Server) routeMSDWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.MSD.Images[name] = &MSDImage{Data: body, Complete: true, ModTS: float64(time.Now().UnixNano()) / 1e9}
+	if f.MSDWriteDelayPolls > 0 {
+		f.msdPendingHide[name] = f.MSDWriteDelayPolls
+	} else {
+		delete(f.msdPendingHide, name)
+	}
 	ok(w, map[string]any{"image": map[string]any{"name": name, "size": len(body), "written": len(body)}})
 }
 
@@ -721,9 +785,13 @@ func (f *Server) routeMSDRemove(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "MsdUnknownImageError", "The image is not found in the storage")
 		return
 	}
-	delete(f.MSD.Images, name)
 	if f.MSD.Drive.Image == name {
 		f.MSD.Drive.Image = ""
+	}
+	if f.MSDRemoveDelayPolls > 0 {
+		f.msdPendingRemove[name] = f.MSDRemoveDelayPolls
+	} else {
+		delete(f.MSD.Images, name)
 	}
 	ok(w, map[string]any{})
 }

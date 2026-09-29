@@ -17,6 +17,13 @@ import (
 // finish applying an OTG start_cdrom change.
 const otgApplyTimeout = 15 * time.Second
 
+// msdConfirmTimeout bounds how long msd upload/remove wait for the device's
+// storage listing to catch up after a write or removal: observed live, kvmd
+// can keep reporting a just-removed image (or omit a just-written one) for a
+// few seconds after the call that changed it already succeeded. A package
+// variable so a test can shorten it to exercise the timeout error quickly.
+var msdConfirmTimeout = 10 * time.Second
+
 // msdDriveResult is the drive stanza of glkvm msd's result.
 type msdDriveResult struct {
 	Image     string `json:"image"`
@@ -54,6 +61,11 @@ type msdUploadResult struct {
 	Name     string `json:"name"`
 	Size     int64  `json:"size"`
 	Replaced bool   `json:"replaced"`
+}
+
+// msdRemoveResult is the result of glkvm msd remove.
+type msdRemoveResult struct {
+	Removed string `json:"removed"`
 }
 
 // buildMSDResult reads the current MSD and OTG state into one msdResult. It
@@ -100,12 +112,18 @@ func doMSDStatus(ctx context.Context, c *kvmd.Client) (msdResult, error) {
 }
 
 // ensureStartCDROM makes the device's start_cdrom OTG function match on,
-// issuing the change only when the device does not already report it (so a
-// caller that is already in the desired state triggers no POST), then polls
-// every waitPollInterval until the device is ready and not mid-apply. It
-// errors when the apply reports a non-empty apply_error, or the device does
-// not become ready within otgApplyTimeout. Toggling this rebuilds the
-// device's USB gadget, which briefly drops the host's keyboard and mouse.
+// issuing the change only when needed (so a caller already in the desired
+// state, with no stale error, triggers no POST), then polls every
+// waitPollInterval until the device is ready and not mid-apply. It errors
+// when the apply reports a non-empty apply_error, or the device does not
+// become ready within otgApplyTimeout. Toggling this rebuilds the device's
+// USB gadget, which briefly drops the host's keyboard and mouse.
+//
+// A POST is issued both when the current state does not already match on
+// and when apply_error is non-empty even though it does: otherwise, once an
+// apply fails, start_cdrom is left sitting at the requested value with its
+// error still attached, so a caller that already matches on would read that
+// stale error back forever, without ever retrying.
 func ensureStartCDROM(ctx context.Context, c *kvmd.Client, on bool) error {
 	cur, err := c.OTGFunctions(ctx)
 	if err != nil {
@@ -115,7 +133,7 @@ func ensureStartCDROM(ctx context.Context, c *kvmd.Client, on bool) error {
 		return nil
 	}
 
-	if cur.StartCDROM != on {
+	if cur.StartCDROM != on || cur.ApplyError != "" {
 		if err := c.SetOTGStartCDROM(ctx, on); err != nil {
 			return err
 		}
@@ -250,8 +268,12 @@ func (p *progressReader) Read(b []byte) (int, error) {
 // replace is set, which removes the existing image first (itself refused
 // while that image is the connected one), and checks free space before
 // opening the file. report, when non-nil, is called with the cumulative
-// percent complete every 5%. It is a plain function, not a cobra RunE, so
-// other callers can use it without cobra.
+// percent complete every 5%. After the upload completes, it polls the
+// device's storage listing every waitPollInterval until the image is listed
+// complete with the uploaded size, erroring if that never happens within
+// msdConfirmTimeout: kvmd's storage view has been observed to lag a write by
+// a few seconds. It is a plain function, not a cobra RunE, so other callers
+// can use it without cobra.
 func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace bool, report progressReport) (msdUploadResult, error) {
 	if name == "" {
 		name = filepath.Base(path)
@@ -300,7 +322,58 @@ func doMSDUpload(ctx context.Context, c *kvmd.Client, path, name string, replace
 		return msdUploadResult{}, err
 	}
 
+	confirmCtx, cancel := context.WithTimeout(ctx, msdConfirmTimeout)
+	defer cancel()
+	waitErr := waitFor(confirmCtx, waitPollInterval, func() (bool, error) {
+		st, err := c.MSD(confirmCtx)
+		if err != nil {
+			return false, err
+		}
+		img, ok := st.Images[name]
+		return ok && img.Complete && img.Size == size, nil
+	})
+	if waitErr != nil {
+		return msdUploadResult{}, fmt.Errorf("uploaded image %q did not appear complete in storage within %s: %w", name, msdConfirmTimeout, waitErr)
+	}
+
 	return msdUploadResult{Name: name, Size: size, Replaced: replaced}, nil
+}
+
+// doMSDRemove deletes name from the device's image storage, refusing when
+// it is the connected image, then confirms the removal landed: kvmd's
+// storage listing has been observed to keep reporting a just-removed image
+// for a few seconds after the remove call already succeeded, so this polls
+// the listing every waitPollInterval until the image is gone, erroring if it
+// never disappears within msdConfirmTimeout. It is a plain function, not a
+// cobra RunE, so other callers can use it without cobra.
+func doMSDRemove(ctx context.Context, c *kvmd.Client, name string) (msdRemoveResult, error) {
+	st, err := c.MSD(ctx)
+	if err != nil {
+		return msdRemoveResult{}, err
+	}
+	if st.Drive.Connected && st.Drive.Image == name {
+		return msdRemoveResult{}, usagef("%q is the connected image; detach first", name)
+	}
+
+	if err := c.MSDRemove(ctx, name); err != nil {
+		return msdRemoveResult{}, err
+	}
+
+	confirmCtx, cancel := context.WithTimeout(ctx, msdConfirmTimeout)
+	defer cancel()
+	waitErr := waitFor(confirmCtx, waitPollInterval, func() (bool, error) {
+		st, err := c.MSD(confirmCtx)
+		if err != nil {
+			return false, err
+		}
+		_, present := st.Images[name]
+		return !present, nil
+	})
+	if waitErr != nil {
+		return msdRemoveResult{}, fmt.Errorf("image %q still listed in storage %s after removal: %w", name, msdConfirmTimeout, waitErr)
+	}
+
+	return msdRemoveResult{Removed: name}, nil
 }
 
 func newMSDCmd(g *globals) *cobra.Command {
@@ -458,21 +531,12 @@ func newMSDRemoveCmd(g *globals) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		name := args[0]
-
-		st, err := c.MSD(cmd.Context())
+		result, err := doMSDRemove(cmd.Context(), c, args[0])
 		if err != nil {
 			return err
 		}
-		if st.Drive.Connected && st.Drive.Image == name {
-			return usagef("%q is the connected image; detach first", name)
-		}
-
-		if err := c.MSDRemove(cmd.Context(), name); err != nil {
-			return err
-		}
-		return render(cmd.OutOrStdout(), g.output, map[string]string{"removed": name}, func(w io.Writer) {
-			fmt.Fprintf(w, "removed %s\n", name)
+		return render(cmd.OutOrStdout(), g.output, result, func(w io.Writer) {
+			fmt.Fprintf(w, "removed %s\n", result.Removed)
 		})
 	}
 	return cmd
