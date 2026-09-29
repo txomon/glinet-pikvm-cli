@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,5 +83,102 @@ func TestDeviceMissingURL(t *testing.T) {
 	f, _ := Load(write(t, `{"devices":{"a":{"user":"u","password":"p"}},"default_device":"a"}`, 0o600))
 	if _, err := f.Device(""); !errors.Is(err, ErrConfig) {
 		t.Fatalf("want ErrConfig for missing url, got %v", err)
+	}
+}
+
+// writeSecret writes body to a file in a fresh temp dir and returns its path.
+func writeSecret(t *testing.T, name, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestResolveFromFilesTrimsTrailingNewline(t *testing.T) {
+	urlFile := writeSecret(t, "url", "https://arwen.example\n")
+	userFile := writeSecret(t, "user", "root\r\n")
+	pwFile := writeSecret(t, "pw", "hunter2\n")
+	cfg := `{"devices":{"a":{"url_file":"` + urlFile + `","user_file":"` + userFile + `","password_file":"` + pwFile + `"}},"default_device":"a"}`
+	f, err := Load(write(t, cfg, 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := f.Device("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.URL != "https://arwen.example" || d.User != "root" || d.Password != "hunter2" {
+		t.Fatalf("got %+v", d)
+	}
+}
+
+func TestValueAndFileConflictRejectedAtLoad(t *testing.T) {
+	for _, cfg := range []string{
+		`{"devices":{"a":{"url":"https://x.example","url_file":"/x"}}}`,
+		`{"devices":{"a":{"url":"https://x.example","user":"u","user_file":"/x"}}}`,
+		`{"devices":{"a":{"url":"https://x.example","password":"p","password_file":"/x"}}}`,
+	} {
+		_, err := Load(write(t, cfg, 0o600))
+		if !errors.Is(err, ErrConfig) {
+			t.Fatalf("cfg %s: want ErrConfig, got %v", cfg, err)
+		}
+	}
+}
+
+func TestMissingFileAtResolveNamesPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	cfg := `{"devices":{"a":{"url_file":"` + missing + `"}},"default_device":"a"}`
+	f, err := Load(write(t, cfg, 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.Device("")
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("want ErrConfig, got %v", err)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Fatalf("error %v does not name path %s", err, missing)
+	}
+	if !strings.Contains(err.Error(), "a") {
+		t.Fatalf("error %v does not name device", err)
+	}
+}
+
+func TestUserDefaultsToAdmin(t *testing.T) {
+	f, _ := Load(write(t, `{"devices":{"a":{"url":"https://x.example"}},"default_device":"a"}`, 0o600))
+	d, err := f.Device("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.User != "admin" {
+		t.Fatalf("user %q, want admin", d.User)
+	}
+}
+
+func TestPasswordEnvOverridesPasswordFile(t *testing.T) {
+	pwFile := writeSecret(t, "pw", "fromfile")
+	t.Setenv("GLKVM_PASSWORD", "fromenv")
+	cfg := `{"devices":{"a":{"url":"https://x.example","password_file":"` + pwFile + `"}},"default_device":"a"}`
+	f, _ := Load(write(t, cfg, 0o600))
+	d, err := f.Device("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Password != "fromenv" {
+		t.Fatalf("password %q, want fromenv", d.Password)
+	}
+}
+
+func TestLookupReturnsRawDeviceWithoutResolvingFiles(t *testing.T) {
+	cfg := `{"devices":{"a":{"url_file":"/does/not/exist"}},"default_device":"a"}`
+	f, _ := Load(write(t, cfg, 0o600))
+	d, err := f.Lookup("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.URLFile != "/does/not/exist" || d.URL != "" {
+		t.Fatalf("got %+v", d)
 	}
 }
