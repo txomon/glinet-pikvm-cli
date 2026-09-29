@@ -171,3 +171,22 @@ func (c *Client) post(ctx context.Context, path string, q url.Values, body io.Re
 func (c *Client) getRaw(ctx context.Context, path string, q url.Values) (*http.Response, error) {
 	return c.do(ctx, http.MethodGet, path, q, nil, "")
 }
+
+// Reach checks that the device answers HTTP requests at all, by sending an
+// unauthenticated GET /info: no X-KVMD-User or X-KVMD-Passwd headers are
+// set. Any response, even a 401 or 403, proves the TCP connection and (for
+// https) the TLS handshake succeeded; only a transport-level failure (no
+// response reaches this client) is reported as an error. Used by doctor's
+// reach check, which must not conflate connectivity with authentication.
+func (c *Client) Reach(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/info", nil)
+	if err != nil {
+		return fmt.Errorf("kvmd: build reach request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("kvmd: unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	return nil
+}
