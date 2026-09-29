@@ -230,22 +230,64 @@ func TestMouseDragPressFailure(t *testing.T) {
 	}
 }
 
-func TestMouseScroll(t *testing.T) {
+func TestMouseScrollDirections(t *testing.T) {
+	cases := []struct {
+		direction  string
+		wantDeltas []string
+	}{
+		{"up", []string{"delta_x=0", "delta_y=-3"}},
+		{"down", []string{"delta_x=0", "delta_y=3"}},
+		{"left", []string{"delta_x=-3", "delta_y=0"}},
+		{"right", []string{"delta_x=3", "delta_y=0"}},
+	}
+	for _, tc := range cases {
+		f := kvmdfake.New(t)
+		if _, e, code := runCLI(t, f, "mouse", "scroll", tc.direction); code != 0 {
+			t.Fatalf("%s: code %d %s", tc.direction, code, e)
+		}
+		got := paths(f, "/api/hid/events/send_mouse_wheel")
+		if len(got) != 1 || !strings.Contains(got[0], tc.wantDeltas[0]) || !strings.Contains(got[0], tc.wantDeltas[1]) {
+			t.Fatalf("%s: %v", tc.direction, got)
+		}
+	}
+}
+
+func TestMouseScrollCustomAmount(t *testing.T) {
 	f := kvmdfake.New(t)
-	// The flag must come before "--" so pflag still parses it as a flag; "--"
-	// then lets the negative DY through as a positional argument.
-	if _, e, code := runCLI(t, f, "mouse", "scroll", "--dx", "3", "--", "-5"); code != 0 {
+	if _, e, code := runCLI(t, f, "mouse", "scroll", "up", "10"); code != 0 {
 		t.Fatalf("code %d %s", code, e)
 	}
 	got := paths(f, "/api/hid/events/send_mouse_wheel")
-	if len(got) != 1 || !strings.Contains(got[0], "delta_x=3") || !strings.Contains(got[0], "delta_y=-5") {
+	if len(got) != 1 || !strings.Contains(got[0], "delta_y=-10") {
 		t.Fatalf("%v", got)
+	}
+}
+
+func TestMouseScrollBadDirection(t *testing.T) {
+	f := kvmdfake.New(t)
+	_, stderr, code := runCLI(t, f, "mouse", "scroll", "sideways")
+	if code != ExitUsage || !strings.Contains(stderr, "sideways") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/")) != 0 {
+		t.Fatal("bad direction reached the device")
+	}
+}
+
+func TestMouseScrollNonPositiveAmount(t *testing.T) {
+	f := kvmdfake.New(t)
+	_, stderr, code := runCLI(t, f, "mouse", "scroll", "up", "0")
+	if code != ExitUsage {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/")) != 0 {
+		t.Fatal("non-positive amount reached the device")
 	}
 }
 
 func TestMouseScrollOutOfRange(t *testing.T) {
 	f := kvmdfake.New(t)
-	_, stderr, code := runCLI(t, f, "mouse", "scroll", "200")
+	_, stderr, code := runCLI(t, f, "mouse", "scroll", "up", "200")
 	if code != ExitUsage || !strings.Contains(stderr, "-127") {
 		t.Fatalf("code %d %s", code, stderr)
 	}
@@ -256,12 +298,47 @@ func TestMouseScrollOutOfRange(t *testing.T) {
 
 func TestMouseNudge(t *testing.T) {
 	f := kvmdfake.New(t)
-	if _, e, code := runCLI(t, f, "mouse", "nudge", "--", "7", "-8"); code != 0 {
+	f.SetMouseAbsolute(false)
+	if _, e, code := runCLI(t, f, "mouse", "nudge", "--dx", "7", "--dy", "-8"); code != 0 {
 		t.Fatalf("code %d %s", code, e)
 	}
 	got := paths(f, "/api/hid/events/send_mouse_relative")
 	if len(got) != 1 || !strings.Contains(got[0], "delta_x=7") || !strings.Contains(got[0], "delta_y=-8") {
 		t.Fatalf("%v", got)
+	}
+}
+
+func TestMouseNudgeAbsoluteFails(t *testing.T) {
+	f := kvmdfake.New(t) // the fake's hid.json capture reports mouse.absolute=true
+	_, stderr, code := runCLI(t, f, "mouse", "nudge", "--dx", "5")
+	if code != ExitDevice || !strings.Contains(stderr, "absolute") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/events/send_mouse_relative")) != 0 {
+		t.Fatal("relative move reached the device despite absolute mouse output")
+	}
+}
+
+func TestMouseNudgeRequiresNonZeroDelta(t *testing.T) {
+	f := kvmdfake.New(t)
+	_, stderr, code := runCLI(t, f, "mouse", "nudge")
+	if code != ExitUsage || !strings.Contains(stderr, "non-zero") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/")) != 0 {
+		t.Fatal("zero delta reached the device")
+	}
+}
+
+func TestMouseNudgeOutOfRange(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.SetMouseAbsolute(false)
+	_, stderr, code := runCLI(t, f, "mouse", "nudge", "--dx", "200")
+	if code != ExitUsage || !strings.Contains(stderr, "-127") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	if len(paths(f, "/api/hid/")) != 0 {
+		t.Fatal("out of range delta reached the device")
 	}
 }
 
@@ -319,6 +396,72 @@ func TestActionWithoutFileHasNoScreenshotKey(t *testing.T) {
 	}
 	if !strings.Contains(out, `"actions": 1`) || strings.Contains(out, "screenshot") {
 		t.Fatalf("out %s", out)
+	}
+}
+
+func TestKeyHoldReleasesAlreadyPressedKeysOnLaterFailure(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailOn("/api/hid/events/send_key", 3, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "press-boom"})
+	_, stderr, code := runCLI(t, f, "key", "--hold", "10ms", "ctrl+alt+del")
+	if code != ExitDevice || !strings.Contains(stderr, "press-boom") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	calls := f.Calls()
+	if len(calls) != 5 {
+		t.Fatalf("want 5 calls (press C, press A, failed press D, release A, release C), got %d: %+v", len(calls), calls)
+	}
+	wantKey := []string{"ControlLeft", "AltLeft", "Delete", "AltLeft", "ControlLeft"}
+	wantState := []string{"true", "true", "true", "false", "false"}
+	for i, c := range calls {
+		if c.Path != "/api/hid/events/send_key" || c.Query.Get("key") != wantKey[i] || c.Query.Get("state") != wantState[i] {
+			t.Fatalf("call %d: %+v (want key=%s state=%s)", i, c, wantKey[i], wantState[i])
+		}
+	}
+}
+
+func TestKeyHoldJoinsPressAndReleaseErrors(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailOn("/api/hid/events/send_key", 3, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "press-boom"})
+	f.FailOn("/api/hid/events/send_key", 4, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "release-boom"})
+	_, stderr, code := runCLI(t, f, "key", "--hold", "10ms", "ctrl+alt+del")
+	if code != ExitDevice || !strings.Contains(stderr, "press-boom") || !strings.Contains(stderr, "release-boom") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	calls := f.Calls()
+	if len(calls) != 5 {
+		t.Fatalf("want 5 calls (press C, press A, failed press D, failed release A, release C), got %d: %+v", len(calls), calls)
+	}
+}
+
+func TestMouseDragReleasesAfterStepFailure(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailOn("/api/hid/events/send_mouse_move", 3, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "move-boom"})
+	_, stderr, code := runCLI(t, f, "mouse", "drag", "0", "0", "100", "100", "--steps", "3")
+	if code != ExitDevice || !strings.Contains(stderr, "move-boom") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	moves := paths(f, "/api/hid/events/send_mouse_move")
+	buttons := paths(f, "/api/hid/events/send_mouse_button")
+	if len(moves) != 3 {
+		t.Fatalf("want 3 moves (start + step 1 + failed step 2), got %v", moves)
+	}
+	if len(buttons) != 2 || !strings.Contains(buttons[0], "state=true") || !strings.Contains(buttons[1], "state=false") {
+		t.Fatalf("want press then release, got %v", buttons)
+	}
+}
+
+func TestMouseDragJoinsStepAndReleaseErrors(t *testing.T) {
+	f := kvmdfake.New(t)
+	f.FailOn("/api/hid/events/send_mouse_move", 3, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "move-boom"})
+	f.FailOn("/api/hid/events/send_mouse_button", 2, kvmdfake.Failure{Status: 400, Kind: "ValidatorError", Msg: "release-boom"})
+	_, stderr, code := runCLI(t, f, "mouse", "drag", "0", "0", "100", "100", "--steps", "3")
+	if code != ExitDevice || !strings.Contains(stderr, "move-boom") || !strings.Contains(stderr, "release-boom") {
+		t.Fatalf("code %d %s", code, stderr)
+	}
+	moves := paths(f, "/api/hid/events/send_mouse_move")
+	buttons := paths(f, "/api/hid/events/send_mouse_button")
+	if len(moves) != 3 || len(buttons) != 2 {
+		t.Fatalf("moves=%v buttons=%v", moves, buttons)
 	}
 }
 

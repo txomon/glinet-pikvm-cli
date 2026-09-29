@@ -393,13 +393,26 @@ func doMouseScroll(ctx context.Context, c *kvmd.Client, dx, dy int) error {
 	return c.MouseWheel(ctx, dx, dy)
 }
 
-// doMouseNudge moves the mouse by the relative delta (dx,dy).
+// doMouseNudge moves the mouse by the relative delta (dx,dy). It reads the
+// current HID state first and fails, before sending anything, when the
+// mouse output is absolute: a relative move is silently ignored there, which
+// would otherwise look like a successful no-op.
 func doMouseNudge(ctx context.Context, c *kvmd.Client, dx, dy int) error {
+	if dx == 0 && dy == 0 {
+		return usagef("nudge requires --dx or --dy to be non-zero")
+	}
 	if err := validDelta("dx", dx); err != nil {
 		return err
 	}
 	if err := validDelta("dy", dy); err != nil {
 		return err
+	}
+	hid, err := c.HID(ctx)
+	if err != nil {
+		return err
+	}
+	if hid.MouseAbsolute {
+		return fmt.Errorf("mouse output is absolute; relative moves are ignored; use mouse move, or switch the mouse output to usb_rel or usb_hybrid")
 	}
 	return c.MouseRelative(ctx, dx, dy)
 }
@@ -408,12 +421,8 @@ func doMouseNudge(ctx context.Context, c *kvmd.Client, dx, dy int) error {
 
 func newMouseCmd(g *globals) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "mouse",
-		Short: "Move, click, drag, scroll or nudge the mouse",
-		Long: "Move, click, drag, scroll or nudge the mouse.\n\n" +
-			"A negative coordinate or delta needs a literal -- before it, e.g.\n" +
-			"\"glkvm mouse nudge -- -5 10\", since a bare -5 would otherwise be\n" +
-			"parsed as an unknown flag.",
+		Use:           "mouse",
+		Short:         "Move, click, drag, scroll or nudge the mouse",
 		Args:          noArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -599,20 +608,55 @@ func newMouseDragCmd(g *globals) *cobra.Command {
 	return cmd
 }
 
+// defaultScrollAmount is "mouse scroll"'s wheel delta when N is omitted.
+const defaultScrollAmount = 3
+
+// directionDelta turns a scroll direction and a positive amount n into the
+// signed (dx,dy) doMouseScroll takes, as a UsageError for any direction
+// other than up, down, left or right.
+func directionDelta(direction string, n int) (dx, dy int, err error) {
+	switch direction {
+	case "up":
+		return 0, -n, nil
+	case "down":
+		return 0, n, nil
+	case "left":
+		return -n, 0, nil
+	case "right":
+		return n, 0, nil
+	default:
+		return 0, 0, usagef("mouse scroll direction must be up, down, left or right, got %q", direction)
+	}
+}
+
 func newMouseScrollCmd(g *globals) *cobra.Command {
-	var dx int
 	var file string
 	cmd := &cobra.Command{
-		Use:           "scroll DY",
-		Short:         "Scroll the mouse wheel",
-		Args:          exactArgs("mouse scroll", 1, "DY"),
+		Use:           "scroll up|down|left|right [N]",
+		Short:         "Scroll the mouse wheel in a direction",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	cmd.Flags().IntVar(&dx, "dx", 0, "horizontal scroll delta")
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) < 1 || len(args) > 2 {
+			return usagef("mouse scroll requires a direction (up, down, left or right) and an optional N, got %d argument(s)", len(args))
+		}
+		return nil
+	}
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		dy, err := atoi("DY", args[0])
+		n := defaultScrollAmount
+		if len(args) == 2 {
+			v, err := atoi("N", args[1])
+			if err != nil {
+				return err
+			}
+			n = v
+		}
+		if n <= 0 {
+			return usagef("N must be a positive integer, got %d", n)
+		}
+		dx, dy, err := directionDelta(args[0], n)
 		if err != nil {
 			return err
 		}
@@ -629,24 +673,19 @@ func newMouseScrollCmd(g *globals) *cobra.Command {
 }
 
 func newMouseNudgeCmd(g *globals) *cobra.Command {
+	var dx, dy int
 	var file string
 	cmd := &cobra.Command{
-		Use:           "nudge DX DY",
+		Use:           "nudge --dx N --dy N",
 		Short:         "Move the mouse by a relative delta",
-		Args:          exactArgs("mouse nudge", 2, "DX", "DY"),
+		Args:          noArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	cmd.Flags().IntVar(&dx, "dx", 0, "horizontal relative delta, -127 to 127")
+	cmd.Flags().IntVar(&dy, "dy", 0, "vertical relative delta, -127 to 127")
 	cmd.Flags().StringVar(&file, "file", "", "take a screenshot after the action")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		dx, err := atoi("DX", args[0])
-		if err != nil {
-			return err
-		}
-		dy, err := atoi("DY", args[1])
-		if err != nil {
-			return err
-		}
 		c, _, err := g.client(cmd.ErrOrStderr())
 		if err != nil {
 			return err

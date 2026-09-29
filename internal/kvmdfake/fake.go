@@ -41,6 +41,12 @@ type Failure struct {
 	Msg    string
 }
 
+// failOnEntry is one queued call-indexed failure, set through FailOn.
+type failOnEntry struct {
+	n       int
+	failure Failure
+}
+
 // MSDImage is one image held in the fake's in-memory MSD image store.
 type MSDImage struct {
 	Data     []byte
@@ -101,6 +107,14 @@ type Server struct {
 	SnapshotJPEG   []byte
 	MSD            MSDState
 	FailNext       map[string]Failure
+
+	// failOn is a call-indexed complement to FailNext, set through FailOn:
+	// it fails the n-th call (1-based) to a path, leaving every other call
+	// unaffected. Several entries can queue for the same path (e.g. to fail
+	// both a press and, separately, the release that follows it).
+	failOn map[string][]failOnEntry
+	// callCounts tracks how many requests each path has received, for failOn.
+	callCounts map[string]int
 
 	// streamerScript, when non-empty, is consumed one stage per GET
 	// /streamer call: routeStreamer applies its first entry to the fields
@@ -195,7 +209,9 @@ func New(t testing.TB) *Server {
 			Images:  map[string]*MSDImage{},
 			Free:    int64(msdFree),
 		},
-		FailNext: map[string]Failure{},
+		FailNext:   map[string]Failure{},
+		failOn:     map[string][]failOnEntry{},
+		callCounts: map[string]int{},
 
 		switchDoc:  loadResult("switch"),
 		infoDoc:    loadResult("info"),
@@ -246,6 +262,27 @@ func (f *Server) CurrentEDID() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.EDID
+}
+
+// FailOn arranges for the n-th call (1-based) to path to fail with failure,
+// leaving every other call to path unaffected. Calling it more than once for
+// the same path queues independent entries (e.g. to fail a press and,
+// separately, the release that follows it, at different call numbers on the
+// same path), unlike FailNext, which always fires on the very next call to a
+// path regardless of how many calls it has already received.
+func (f *Server) FailOn(path string, n int, failure Failure) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOn[path] = append(f.failOn[path], failOnEntry{n: n, failure: failure})
+}
+
+// SetMouseAbsolute flips the fake's reported hid.mouse.absolute flag, for
+// testing behavior that depends on the active mouse output mode.
+func (f *Server) SetMouseAbsolute(absolute bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	mouse := f.hidDoc["mouse"].(map[string]any)
+	mouse["absolute"] = absolute
 }
 
 // SetSource updates the streamer's capture state, setting the HDMI signal
@@ -351,6 +388,16 @@ func (f *Server) newMux() http.Handler {
 			delete(f.FailNext, r.URL.Path)
 			fail(w, failure.Status, failure.Kind, failure.Msg)
 			return
+		}
+
+		f.callCounts[r.URL.Path]++
+		count := f.callCounts[r.URL.Path]
+		for i, entry := range f.failOn[r.URL.Path] {
+			if entry.n == count {
+				f.failOn[r.URL.Path] = append(f.failOn[r.URL.Path][:i], f.failOn[r.URL.Path][i+1:]...)
+				fail(w, entry.failure.Status, entry.failure.Kind, entry.failure.Msg)
+				return
+			}
 		}
 
 		mux.ServeHTTP(w, r)
