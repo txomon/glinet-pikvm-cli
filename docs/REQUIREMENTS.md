@@ -126,10 +126,10 @@ verb per operation, `--output=json` everywhere, `--file` for images.
 
 ## Live testing rules (Locked, agreed 2026-09-29)
 
-* Port 4 is pippin, the workstation this is developed on. The chromebook profile is just a
-  resolution that suits the Chromebook used to view it.
+* Port 4 is pippin, the workstation this is developed on. The chromebook profiles are just
+  resolutions that suit the Chromebook used to view it.
 * Ports may be switched freely during testing. Leave arwen on port 4 when done.
-* All EDID profiles may be flashed. Leave `chromebook` flashed when done.
+* All EDID profiles may be flashed.
 * HID tests on pippin go to an empty text editor javier left focused. Confirm the editor
   still has focus before sending anything; send plain text, Backspace, arrows and F13 to
   F24 only, no shortcuts, no Enter outside the editor, no clicks. Verify through
