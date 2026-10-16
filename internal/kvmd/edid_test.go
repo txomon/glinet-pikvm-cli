@@ -38,5 +38,5 @@ func TestEDIDRoundTrip(t *testing.T) {
 	if last.Path != "/api/upgrade/edid" || !bytes.HasPrefix(last.Body, []byte("edid=00ffffffffffff00")) {
 		t.Fatalf("flash call %+v", last)
 	}
-	_ = edid.ChromebookHex
+	_ = edid.Chromebook1200Hex
 }

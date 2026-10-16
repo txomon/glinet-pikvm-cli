@@ -288,7 +288,7 @@ func newEdidCmd(g *globals) *cobra.Command {
 			fmt.Fprintf(w, "capture: %s\n", result.Capture)
 			fmt.Fprintln(w, "profiles:")
 			for _, p := range result.Profiles {
-				fmt.Fprintf(w, "  %-10s %s\n", p.Name, p.Mode)
+				fmt.Fprintf(w, "  %-16s %s\n", p.Name, p.Mode)
 			}
 		})
 	}

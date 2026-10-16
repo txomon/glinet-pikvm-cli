@@ -109,7 +109,7 @@ func TestScreenshotNoSignal(t *testing.T) {
 func TestStatus(t *testing.T) {
 	f := kvmdfake.New(t)
 	out, _, code := runCLI(t, f, "status", "-o", "json")
-	if code != 0 || !strings.Contains(out, `"profile": "chromebook"`) || !strings.Contains(out, `"model": "RM4PE"`) {
+	if code != 0 || !strings.Contains(out, `"profile": "chromebook-1200"`) || !strings.Contains(out, `"model": "RM4PE"`) {
 		t.Fatalf("code %d out %s", code, out)
 	}
 }

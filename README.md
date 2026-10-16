@@ -221,8 +221,11 @@ glkvm edid set -d arwen chromebook
 ```
 
 Profiles: `4k` (3840x2160@30), `2k` (2560x1440@60, factory default), `1k`
-(1920x1080@60), `chromebook` (1200x752@60, matches the capture device's native
-mode). One EDID covers all four HDMI inputs. `edid set --file PATH` flashes a raw hex
+(1920x1080@60), `chromebook-1600` (1600x1000@60), `chromebook-1412`
+(1412x880@60; 882 fails the divisible-by-4 rule), `chromebook-1200`
+(1200x752@60, matches the capture device's native mode). `chromebook` is
+`chromebook-1600`, and `edid`/`status` report that hex as `chromebook`. One EDID
+covers all four HDMI inputs. `edid set --file PATH` flashes a raw hex
 file instead of a named profile; `edid dump` writes the currently flashed hex.
 `edid set --force` flashes even when the mode fails the gsv1127x capture rules
 above; `--settle` (default 15s) bounds how long it waits, after flashing, for the

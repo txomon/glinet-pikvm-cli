@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/txomon/glinet-pikvm-cli/internal/edid"
@@ -29,33 +28,21 @@ type statusResult struct {
 	Profile  string `json:"profile"`
 }
 
-// edidProfiles are the named profiles doStatus checks the flashed EDID
-// against, beyond the chromebook default.
-var edidProfiles = []string{"4k", "2k", "1k"}
-
-// matchEDIDProfile compares flashedHex (already lowercase) against
-// edid.ChromebookHex and against the device's edid_list preset contents for
-// each named profile, and reports the first match, or "custom".
+// matchEDIDProfile compares flashedHex (already lowercase) against each
+// named profile in edid.Profiles order, the embedded blobs directly and the
+// presets through the device's edid_list contents, and reports the first
+// match, or "custom". chromebook comes before chromebook-1600, so their
+// shared hex reports as chromebook.
 func matchEDIDProfile(flashedHex string, presets []kvmd.EDIDPreset) string {
-	if flashedHex == edid.ChromebookHex {
-		return "chromebook"
-	}
-
-	byKey := make(map[string]string, len(presets))
-	for _, p := range presets {
-		byKey[p.Key] = strings.ToLower(p.Content)
-	}
-
-	for _, name := range edidProfiles {
-		key, _, err := edid.PresetKey(name)
+	for _, name := range edid.Profiles {
+		profileHex, err := resolveEdidSetHex(name, "", presets)
 		if err != nil {
 			continue
 		}
-		if content, ok := byKey[key]; ok && content == flashedHex {
+		if profileHex == flashedHex {
 			return name
 		}
 	}
-
 	return "custom"
 }
 

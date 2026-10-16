@@ -47,9 +47,23 @@ func TestEdidSetProfileFlashesAndReadsBack(t *testing.T) {
 	}
 }
 
+func TestEdidSetChromebookIs1600(t *testing.T) {
+	f := kvmdfake.New(t)
+	out, stderr, code := runCLI(t, f, "edid", "set", "chromebook", "--settle", "50ms", "-o", "json")
+	if code != 0 {
+		t.Fatalf("code %d out %s err %s", code, out, stderr)
+	}
+	if !strings.HasPrefix(f.CurrentEDID(), edid.Chromebook1600Hex[:256]) {
+		t.Fatal("chromebook-1600 not flashed")
+	}
+	if !strings.Contains(out, `"profile": "chromebook"`) || !strings.Contains(out, `"mode": "1600x1000@59.87"`) {
+		t.Fatalf("out %s", out)
+	}
+}
+
 func TestEdidSetUnchanged(t *testing.T) {
-	f := kvmdfake.New(t) // fake starts with the chromebook edid
-	out, _, code := runCLI(t, f, "edid", "set", "chromebook", "-o", "json")
+	f := kvmdfake.New(t) // fake starts with the chromebook-1200 edid
+	out, _, code := runCLI(t, f, "edid", "set", "chromebook-1200", "-o", "json")
 	if code != 0 || !strings.Contains(out, `"changed": false`) {
 		t.Fatalf("code %d out %s", code, out)
 	}
@@ -63,7 +77,7 @@ func TestEdidSetUnchanged(t *testing.T) {
 func TestEdidSetRejectsUncapturable(t *testing.T) {
 	f := kvmdfake.New(t)
 	// 1200x750: patch the chromebook DTD vActive low byte f0 -> ee and fix checksum
-	b := []byte(edid.ChromebookHex)
+	b := []byte(edid.Chromebook1200Hex)
 	copy(b[59*2:], "ee")
 	hexStr := string(b)
 	p := filepath.Join(t.TempDir(), "e.hex")
@@ -76,7 +90,7 @@ func TestEdidSetRejectsUncapturable(t *testing.T) {
 
 func TestEdidValidateOffline(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "e.hex")
-	_ = os.WriteFile(p, []byte(edid.ChromebookHex), 0o600)
+	_ = os.WriteFile(p, []byte(edid.Chromebook1200Hex), 0o600)
 	var out, errb strings.Builder
 	code := Execute([]string{"--config", "/nonexistent", "edid", "validate", p}, strings.NewReader(""), &out, &errb)
 	if code != 0 || !strings.Contains(out.String(), "1200x752") {
@@ -98,7 +112,7 @@ func TestEdidSetFileBareBaseBlock(t *testing.T) {
 	// report changed=false immediately. Flip the harmless week-of-manufacture
 	// byte (offset 16) so this base block actually differs, then fix up the
 	// checksum that patch invalidates.
-	b := []byte(edid.ChromebookHex[:256])
+	b := []byte(edid.Chromebook1200Hex[:256])
 	b[32], b[33] = '0', '9'
 	baseBlock := fixChecksum(t, string(b))
 	p := filepath.Join(t.TempDir(), "base.hex")

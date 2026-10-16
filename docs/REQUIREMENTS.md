@@ -68,20 +68,21 @@ served under `/api` by nginx. Calls marked verified were made against arwen on 2
 
 ## EDID profiles (Locked)
 
-Four named profiles, flashed through `POST /upgrade/edid`. Preset hex comes from
-`edid_list` at runtime; the Chromebook hex ships with the tool.
+Seven named profiles, flashed through `POST /upgrade/edid`. Preset hex comes from
+`edid_list` at runtime; the Chromebook hex ships with the tool in
+`internal/edid/profiles.go`.
 
 * `4k`: preset `E3840x2160`, 3840x2160@30, Lontium.
 * `2k`: preset `E2560x1440`, 2560x1440@60, GLKVM, the factory default.
 * `1k`: preset `E1920x1080`, 1920x1080@60, ASUS. The `E1920x1080AOC` preset at 120 Hz is
   the alternative.
-* `chromebook`: the GLKVM 2K EDID with its first detailed timing replaced by
-  1200x752@59.8 (73.25 MHz pixel clock). It is flashed on arwen now and captures at
-  `1200x752@60`, which settles the earlier untested 1200x752 substitute.
-
-```
-00ffffffffffff001d891cc28a0e0000081f0103803c22782a2d71af4f44a9270d5054210800d1c095c095008180814081c0010101019d1cb07041f01d2040783a0020542100001c000000ff003839313234370a202020202020000000fc00474c4b564d0a20202020202020000000fd00304b1e721e000a20202020202001e9020327f04b101f051404130312021101230907078301000065030c001000681a00000101304b00023a801871382d40582c450055502100001e8c0ad08a20e02d10103e96005550210000188c0ad090204031200c405500555021000018f03c00d051a0355060883a0055502100001c00000000000000000000000000000000ae
-```
+* `chromebook-1600`, `chromebook-1412`, `chromebook-1200`: the GLKVM 2K EDID with its first
+  detailed timing replaced by the `cvt` mode for 1600x1000@59.87 (132.25 MHz),
+  1412x880@59.87 (102 MHz) and 1200x752@59.82 (73.25 MHz). 1412x882 fails the
+  divisible-by-4 capture rule, so 1412 uses 880; `cvt` rounds it to 1416, so 1412 keeps
+  that timing with 4 more pixels of front porch. 1200x752 matches the device preset
+  `E1200x752CB` and captures at `1200x752@60`.
+* `chromebook`: `chromebook-1600` under its short name.
 
 `glkvm edid arwen` reports which profile matches the flashed EDID by comparing hex.
 
@@ -97,7 +98,7 @@ verb per operation, `--output=json` everywhere, `--file` for images.
 * `glkvm port arwen` shows the active port with HDMI and USB link state for all four;
   `glkvm port arwen 2`, `next`, `prev` switch it and wait for capture to settle.
 * `glkvm edid arwen` shows the flashed EDID and which profile it matches;
-  `glkvm edid arwen 4k|2k|1k|chromebook` flashes one; `glkvm edid validate <file>` checks a
+  `glkvm edid arwen <profile>` flashes one; `glkvm edid validate <file>` checks a
   raw EDID against the gsv1127x capture rules before it goes near the device.
 * `glkvm key arwen ctrl+alt+del`, `glkvm type arwen "text"`.
 * `glkvm mouse arwen move|click|double-click|drag|scroll` with absolute coordinates in
@@ -128,7 +129,7 @@ verb per operation, `--output=json` everywhere, `--file` for images.
 * Port 4 is pippin, the workstation this is developed on. The chromebook profile is just a
   resolution that suits the Chromebook used to view it.
 * Ports may be switched freely during testing. Leave arwen on port 4 when done.
-* All four EDID profiles may be flashed. Leave `chromebook` flashed when done.
+* All EDID profiles may be flashed. Leave `chromebook` flashed when done.
 * HID tests on pippin go to an empty text editor javier left focused. Confirm the editor
   still has focus before sending anything; send plain text, Backspace, arrows and F13 to
   F24 only, no shortcuts, no Enter outside the editor, no clicks. Verify through
